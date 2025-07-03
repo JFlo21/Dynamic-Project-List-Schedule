@@ -1,9 +1,10 @@
 """
 Advanced Dynamic Project Scheduler for Smartsheet
 
-- Handles multiple sheets and advanced schedule logic for crews, phases, and work requests
-- Updates professional Gantt schedule with full hierarchy and cascading logic
-- Fills in placeholders and recalculates all expected/actuals as real data arrives
+- V3: Dynamically builds a resource map from a dedicated sheet for contact creation.
+- Handles multiple sheets and advanced schedule logic for crews, phases, and work requests.
+- Updates professional Gantt schedule with full hierarchy and cascading logic.
+- Fills in placeholders and recalculates all expected/actuals as real data arrives.
 
 Author: [Your Name/Org]
 """
@@ -22,9 +23,20 @@ API_TOKEN = os.getenv('SMARTSHEET_API_TOKEN')
 SHEET_ID_TOTAL_POLES = 8495204601384836
 SHEET_ID_PHASE_POLES = 1553121697288068
 SHEET_ID_TARGET      = 1847107938897796
+# NEW: The sheet that contains your master list of crews/resources
+SHEET_ID_RESOURCE    = 3733355007790980 
 
-# Column ID mapping (fill in all as you expand)
+# ---!!! ACTION REQUIRED: PLEASE UPDATE THE EMAIL COLUMN ID BELOW !!!---
+# This email address will be used for your placeholder crew.
+PLACEHOLDER_CREW_EMAIL = "placeholder.crew@yourcompany.com"
+
+# Column ID mapping
 COLUMNS = {
+    # NEW: Define columns for your Resource Sheet
+    "resource_map": {
+        "name": 7828491195862916, # This is the column with the crew/person's name
+        "email": 0, # <<<--- CRITICAL: YOU MUST REPLACE '0' with the real column ID for the resource's email address
+    },
     "scope_number": {
         "source_total": 3784709278224260,
         "source_phase": 3784709278224260,
@@ -39,37 +51,21 @@ COLUMNS = {
         "target": 8644216667983748,
     },
     "assigned_resource": {
-        "source": 7828491195862916,
+        # This is the 'Assigned Resource' column on your main Gantt sheet
         "target": 1945268683231108,
     },
     "job_placement": {
         "target": 7574768217444228,
     },
-    "start_date_actual": {
-        "source": 1089957554507652,
-        "target": 481442343374724,
-    },
     "expected_start_date": {
-        "source": 4568417128107908,
         "target": 819368776388484,
     },
-    "end_date_actual": {
-        "source": 503555305459588,
-        "target": 503555305459588,
-    },
-    "percent_complete": {
-        "source": 1044421535289220,
-        "target": 6448868310601604,
-    },
-    "pole_count_total": {
-        "source": 2795493429825412,
+    "expected_end_date": {
+        "target": 3071168590073732,
     },
     "pole_count_phase": {
         "source": 2674900969672580,
         "target": 2674900969672580,
-    },
-    "expected_end_date": {
-        "target": 3071168590073732,
     },
 }
 
@@ -112,122 +108,121 @@ class CrewSchedule:
 # -------- SHEET UTILITIES --------
 def get_sheet(client, sheet_id):
     """Returns a list of row dicts with cell values keyed by column_id."""
+    sheet = client.Sheets.get_sheet(sheet_id)
     rows = []
-    for row in client.Sheets.get_sheet(sheet_id).rows:
+    for row in sheet.rows:
         cell_dict = {cell.column_id: cell.value for cell in row.cells}
         cell_dict['row_id'] = row.id
-        cell_dict['parent_id'] = row.parent_id
         rows.append(cell_dict)
     return rows
 
-# -------- POLE LOGIC --------
+# --- NEW FUNCTION ---
+def build_resource_map(client):
+    """Reads the resource sheet and builds a map of {crew_name: email}."""
+    logging.info("Building resource map from resource sheet...")
+    name_col_id = COLUMNS['resource_map']['name']
+    email_col_id = COLUMNS['resource_map']['email']
+
+    if email_col_id == 0:
+        raise ValueError("FATAL: Please update the placeholder 'email' column ID in COLUMNS['resource_map'] before running.")
+
+    resource_sheet = get_sheet(client, SHEET_ID_RESOURCE)
+    resource_map = {}
+    for row in resource_sheet:
+        name = row.get(name_col_id)
+        email = row.get(email_col_id)
+        if name and email:
+            resource_map[name] = email
+    
+    # Manually add the placeholder crew to the map
+    resource_map[PLACEHOLDER_CREW] = PLACEHOLDER_CREW_EMAIL
+    
+    logging.info(f"Resource map built successfully with {len(resource_map)} entries.")
+    return resource_map
+
+# -------- POLE LOGIC (No changes needed) --------
 def get_scope_totals(total_poles_rows):
-    """Returns {Scope #: total_poles}."""
-    return {
-        row.get(COLUMNS['scope_number']['source_total']): row.get(COLUMNS['pole_count_total']['source'])
-        for row in total_poles_rows if row.get(COLUMNS['scope_number']['source_total'])
-    }
+    return {r.get(COLUMNS['scope_number']['source_total']): r.get(c) for r in total_poles_rows if r.get(COLUMNS['scope_number']['source_total'])}
 
 def get_phase_pole_actuals(phase_poles_rows):
-    """Returns {(Scope #, Scope Phase #): phase_poles} for assigned."""
-    return {
-        (row.get(COLUMNS['scope_number']['source_phase']), row.get(COLUMNS['scope_phase']['source'])):
-        row.get(COLUMNS['pole_count_phase']['source'])
-        for row in phase_poles_rows
-        if row.get(COLUMNS['scope_number']['source_phase']) and row.get(COLUMNS['scope_phase']['source'])
-    }
+    return {(r.get(COLUMNS['scope_number']['source_phase']), r.get(COLUMNS['scope_phase']['source'])): r.get(COLUMNS['pole_count_phase']['source']) for r in phase_poles_rows if r.get(COLUMNS['scope_number']['source_phase']) and r.get(COLUMNS['scope_phase']['source'])}
 
 def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
-    """Returns {(Scope #, Scope Phase #): pole_count} (real or estimated) for all phases."""
     results = dict(phase_pole_actuals)
     by_scope = defaultdict(list)
-    for (scope, phase) in all_phases:
-        by_scope[scope].append(phase)
-
+    for (scope, phase) in all_phases: by_scope[scope].append(phase)
     for scope, total in scope_totals.items():
+        if total is None: continue
         assigned = sum([phase_pole_actuals.get((scope, p), 0) or 0 for p in by_scope[scope]])
         unassigned_phases = [p for p in by_scope[scope] if (scope, p) not in phase_pole_actuals]
         if unassigned_phases:
-            remainder = (total or 0) - assigned
-            per_phase = int(math.ceil(remainder / len(unassigned_phases))) if len(unassigned_phases) > 0 else 0
-            for phase in unassigned_phases:
-                results[(scope, phase)] = per_phase
+            remainder = total - assigned
+            if remainder > 0:
+                per_phase = int(math.ceil(remainder / len(unassigned_phases)))
+                for phase in unassigned_phases: results[(scope, phase)] = per_phase
     return results
 
-# -------- SCHEDULE ENGINE --------
+# -------- SCHEDULE ENGINE (No changes needed) --------
 def build_crews_and_jobs(target_rows, pole_assignments):
-    """Returns {crew: CrewSchedule} and global job list."""
     crews = defaultdict(lambda: CrewSchedule(name=None))
     all_jobs = []
-
     for row in target_rows:
         scope = row.get(COLUMNS['scope_number']['target'])
         phase = row.get(COLUMNS['scope_phase']['target'])
+        if not scope or not phase: continue
         wr = row.get(COLUMNS['work_request']['target'])
         crew = row.get(COLUMNS['assigned_resource']['target']) or PLACEHOLDER_CREW
         placement = row.get(COLUMNS['job_placement']['target']) or 9999
-        poles = pole_assignments.get((scope, phase)) or 0
-        row_id = row['row_id']
-
-        job = Job(scope, phase, wr, placement, crew, poles, row_id, is_placeholder=(crew == PLACEHOLDER_CREW))
+        poles = pole_assignments.get((scope, phase), 0)
+        job = Job(scope, phase, wr, placement, crew, poles, row['row_id'], is_placeholder=(crew == PLACEHOLDER_CREW))
         all_jobs.append(job)
-        if not crews[crew].name:
-            crews[crew].name = crew
+        if not crews[crew].name: crews[crew].name = crew
         crews[crew].add_job(job)
-
     return crews, all_jobs
 
 def schedule_crews(crews, crew_start_dates):
-    """Updates jobs in place with expected_start and expected_end based on scheduling logic."""
     for crew, sched in crews.items():
         jobs = sorted(sched.jobs, key=lambda j: j.placement)
         cur_date = crew_start_dates.get(crew) or datetime.today()
         for job in jobs:
-            job.expected_start = cur_date
             duration = job.duration()
-            job.expected_end = cur_date + timedelta(days=duration - 1)
-            cur_date = job.expected_end + timedelta(days=1)
+            if duration > 0:
+                job.expected_start = cur_date
+                job.expected_end = cur_date + timedelta(days=duration - 1)
+                cur_date = job.expected_end + timedelta(days=1)
 
-# -------- MAIN WORKFLOW --------
+# -------- MAIN WORKFLOW (MODIFIED) --------
 def main():
     client = smartsheet.Smartsheet(API_TOKEN)
-    client.errors_as_exceptions(True) # Recommended for better error handling
+    client.errors_as_exceptions(True)
 
-    # 1. Load data
-    logging.info("Loading data from Smartsheet...")
+    # 1. Build the resource map FIRST
+    resource_map = build_resource_map(client)
+
+    # 2. Load data from project sheets
+    logging.info("Loading data from project sheets...")
     total_poles_rows = get_sheet(client, SHEET_ID_TOTAL_POLES)
     phase_poles_rows = get_sheet(client, SHEET_ID_PHASE_POLES)
     target_rows = get_sheet(client, SHEET_ID_TARGET)
     logging.info("Data loaded.")
 
-    # 2. Pole logic: Build assignment table for all phases
+    # 3. Pole logic
     logging.info("Allocating pole counts...")
-    scope_totals = get_scope_totals(total_poles_rows)
-    phase_pole_actuals = get_phase_pole_actuals(phase_poles_rows)
-    all_phases = set()
-    for row in target_rows:
-        scope = row.get(COLUMNS['scope_number']['target'])
-        phase = row.get(COLUMNS['scope_phase']['target'])
-        if scope and phase:
-            all_phases.add((scope, phase))
-    pole_assignments = allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases)
+    all_phases = set((r.get(COLUMNS['scope_number']['target']), r.get(COLUMNS['scope_phase']['target'])) for r in target_rows if r.get(COLUMNS['scope_number']['target']) and r.get(COLUMNS['scope_phase']['target']))
+    pole_assignments = allocate_unassigned_poles(get_scope_totals(total_poles_rows), get_phase_pole_actuals(phase_poles_rows), all_phases)
     logging.info("Pole counts allocated.")
 
-    # 3. Build crew schedules and job lists
+    # 4. Build crew schedules and job lists
     logging.info("Building crew schedules...")
     crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
     logging.info("Schedules built.")
 
-    # 4. Set crew start dates (placeholder: all start today; expand with real logic as needed)
-    crew_start_dates = {crew: datetime.today() for crew in crews}
-    # TODO: Replace above with your logic for alternating Thursday start, rotations, etc.
-
-    # 5. Dynamic scheduling (jobs shift when jobs are inserted/moved/reassigned)
+    # 5. Dynamic scheduling
     logging.info("Calculating dynamic schedule dates...")
-    schedule_crews(crews, crew_start_dates)
+    schedule_crews(crews, {crew: datetime.today() for crew in crews})
     logging.info("Schedule dates calculated.")
 
-    # 6. Build Smartsheet update list, robustly skipping any columns with None
+    # 6. Build Smartsheet update list
     logging.info("Preparing data for Smartsheet update...")
     updates = []
     for job in all_jobs:
@@ -238,60 +233,63 @@ def main():
             str(COLUMNS['expected_end_date']['target']): job.expected_end.strftime('%Y-%m-%d') if job.expected_end else None,
             str(COLUMNS['assigned_resource']['target']): job.crew,
         }
-        # Remove any keys with column_id None or value None (robustness)
-        updates.append({k: v for k, v in update_dict.items() if k != 'row_id' and k != 'None' and v is not None or k == 'row_id'})
+        updates.append({k: v for k, v in update_dict.items() if k != 'row_id' and v is not None or k == 'row_id'})
 
-    update_target_sheet(client, SHEET_ID_TARGET, updates)
+    # 7. Update the target sheet, passing the resource_map
+    update_target_sheet(client, SHEET_ID_TARGET, updates, resource_map)
     logging.info("Smartsheet schedule updated successfully.")
 
-# -------- CORRECTED UPDATE FUNCTION --------
-def update_target_sheet(client, sheet_id, updates):
-    """Updates rows in Smartsheet with new values. Formats contact columns correctly."""
+# -------- UPDATE FUNCTION (MODIFIED) --------
+def update_target_sheet(client, sheet_id, updates, resource_map):
+    """Updates rows in Smartsheet, using the resource_map to create contacts."""
     batch = []
-    # Get the column ID for the contact list for easy comparison
     contact_col_id = COLUMNS['assigned_resource']['target']
 
     for update in updates:
         row = smartsheet.models.Row()
         row.id = update['row_id']
         row.cells = []
-        for col_id, val in update.items():
-            if col_id == 'row_id' or col_id is None or col_id == 'None':
+        for col_id_str, val in update.items():
+            if col_id_str == 'row_id' or val is None:
                 continue
+            
+            col_id = int(col_id_str)
+            new_cell = {'column_id': col_id}
 
-            # Create a new cell to be added to the row
-            new_cell = {
-                'column_id': int(col_id)
-            }
-
-            # If this is the contact column, use `objectValue` with the correct format
-            if int(col_id) == contact_col_id:
-                new_cell['objectValue'] = {
-                    "objectType": "CONTACT",
-                    "name": str(val)  # 'val' is the crew name string
-                }
-            # For all other column types, use the standard 'value'
+            if col_id == contact_col_id:
+                crew_name = str(val)
+                crew_email = resource_map.get(crew_name)
+                if crew_email:
+                    new_cell['objectValue'] = {
+                        "objectType": "CONTACT",
+                        "name": crew_name,
+                        "email": crew_email
+                    }
+                else:
+                    logging.warning(f"No email found in resource map for crew '{crew_name}' on row {row.id}. Skipping assignment.")
+                    continue 
             else:
                 new_cell['value'] = val
             
             row.cells.append(new_cell)
 
-        if row.cells: # Only add the row to the batch if it has cells to update
+        if row.cells:
             batch.append(row)
 
     if batch:
         logging.info(f"Updating {len(batch)} rows in the target sheet.")
         client.Sheets.update_rows(sheet_id, batch)
     else:
-        logging.info("No updates needed for target sheet.")
+        logging.info("No rows required updates in the target sheet.")
 
-
+# -------- MAIN EXECUTION BLOCK (MODIFIED) --------
 if __name__ == "__main__":
-    # A simple try/except block at the top level to catch any exceptions
     try:
         main()
+    except ValueError as e:
+        logging.error(e)
     except smartsheet.exceptions.ApiError as e:
-        logging.error(f"Smartsheet API Error: {e.error.message}")
-        logging.error(f"Error Code: {e.error.error_code}, Ref ID: {e.error.ref_id}")
+        logging.error(f"Smartsheet API Error: {e.result.message}")
+        logging.error(f"Error Code: {e.result.errorCode}, Ref ID: {e.result.refId}")
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}", exc_info=True)

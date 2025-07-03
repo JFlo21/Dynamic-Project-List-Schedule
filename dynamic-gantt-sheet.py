@@ -69,7 +69,7 @@ COLUMNS = {
         "target": 2674900969672580,
     },
     "expected_end_date": {
-        "target": 3071168590073732,  # <--- Added your column id here!
+        "target": 3071168590073732,
     },
 }
 
@@ -191,13 +191,17 @@ def schedule_crews(crews, crew_start_dates):
 # -------- MAIN WORKFLOW --------
 def main():
     client = smartsheet.Smartsheet(API_TOKEN)
+    client.errors_as_exceptions(True) # Recommended for better error handling
 
     # 1. Load data
+    logging.info("Loading data from Smartsheet...")
     total_poles_rows = get_sheet(client, SHEET_ID_TOTAL_POLES)
     phase_poles_rows = get_sheet(client, SHEET_ID_PHASE_POLES)
     target_rows = get_sheet(client, SHEET_ID_TARGET)
+    logging.info("Data loaded.")
 
     # 2. Pole logic: Build assignment table for all phases
+    logging.info("Allocating pole counts...")
     scope_totals = get_scope_totals(total_poles_rows)
     phase_pole_actuals = get_phase_pole_actuals(phase_poles_rows)
     all_phases = set()
@@ -207,18 +211,24 @@ def main():
         if scope and phase:
             all_phases.add((scope, phase))
     pole_assignments = allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases)
+    logging.info("Pole counts allocated.")
 
     # 3. Build crew schedules and job lists
+    logging.info("Building crew schedules...")
     crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
+    logging.info("Schedules built.")
 
     # 4. Set crew start dates (placeholder: all start today; expand with real logic as needed)
     crew_start_dates = {crew: datetime.today() for crew in crews}
     # TODO: Replace above with your logic for alternating Thursday start, rotations, etc.
 
     # 5. Dynamic scheduling (jobs shift when jobs are inserted/moved/reassigned)
+    logging.info("Calculating dynamic schedule dates...")
     schedule_crews(crews, crew_start_dates)
+    logging.info("Schedule dates calculated.")
 
     # 6. Build Smartsheet update list, robustly skipping any columns with None
+    logging.info("Preparing data for Smartsheet update...")
     updates = []
     for job in all_jobs:
         update_dict = {
@@ -228,36 +238,60 @@ def main():
             str(COLUMNS['expected_end_date']['target']): job.expected_end.strftime('%Y-%m-%d') if job.expected_end else None,
             str(COLUMNS['assigned_resource']['target']): job.crew,
         }
-        # Remove any keys with column_id None (robustness)
+        # Remove any keys with column_id None or value None (robustness)
         updates.append({k: v for k, v in update_dict.items() if k != 'row_id' and k != 'None' and v is not None or k == 'row_id'})
 
     update_target_sheet(client, SHEET_ID_TARGET, updates)
     logging.info("Smartsheet schedule updated successfully.")
 
+# -------- CORRECTED UPDATE FUNCTION --------
 def update_target_sheet(client, sheet_id, updates):
-    """Updates rows in Smartsheet with new values. Skips invalid column IDs."""
+    """Updates rows in Smartsheet with new values. Formats contact columns correctly."""
     batch = []
+    # Get the column ID for the contact list for easy comparison
+    contact_col_id = COLUMNS['assigned_resource']['target']
+
     for update in updates:
         row = smartsheet.models.Row()
         row.id = update['row_id']
         row.cells = []
         for col_id, val in update.items():
-            if col_id == 'row_id':
+            if col_id == 'row_id' or col_id is None or col_id == 'None':
                 continue
-            if col_id is None or col_id == 'None':
-                continue
-            try:
-                row.cells.append({
-                    'column_id': int(col_id),
-                    'value': val
-                })
-            except Exception as e:
-                logging.warning(f"Could not update column {col_id}: {e}")
-        batch.append(row)
+
+            # Create a new cell to be added to the row
+            new_cell = {
+                'column_id': int(col_id)
+            }
+
+            # If this is the contact column, use `objectValue` with the correct format
+            if int(col_id) == contact_col_id:
+                new_cell['objectValue'] = {
+                    "objectType": "CONTACT",
+                    "name": str(val)  # 'val' is the crew name string
+                }
+            # For all other column types, use the standard 'value'
+            else:
+                new_cell['value'] = val
+            
+            row.cells.append(new_cell)
+
+        if row.cells: # Only add the row to the batch if it has cells to update
+            batch.append(row)
+
     if batch:
+        logging.info(f"Updating {len(batch)} rows in the target sheet.")
         client.Sheets.update_rows(sheet_id, batch)
     else:
-        logging.info("No updates needed.")
+        logging.info("No updates needed for target sheet.")
+
 
 if __name__ == "__main__":
-    main()
+    # A simple try/except block at the top level to catch any exceptions
+    try:
+        main()
+    except smartsheet.exceptions.ApiError as e:
+        logging.error(f"Smartsheet API Error: {e.error.message}")
+        logging.error(f"Error Code: {e.error.error_code}, Ref ID: {e.error.ref_id}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}", exc_info=True)

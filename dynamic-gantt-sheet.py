@@ -8,10 +8,12 @@ from datetime import datetime, timedelta
 # -------- CONFIGURATION --------
 API_TOKEN = os.getenv('SMARTSHEET_API_TOKEN')
 
-SHEET_ID_TOTAL_POLES = 8495204601384836
-SHEET_ID_PHASE_POLES = 1553121697288068
-SHEET_ID_TARGET      = 1847107938897796
+SHEET_ID_TOTAL_POLES      = 8495204601384836
+SHEET_ID_PHASE_POLES      = 1553121697288068
+SHEET_ID_CREW_REFERENCE   = 937765308682116    # New: Crew name lookup (by Work Request # or other key)
+SHEET_ID_TARGET           = 1847107938897796
 
+# Column ID mapping (fill in as you expand)
 COLUMNS = {
     "scope_number": {
         "source_total": 3784709278224260,
@@ -24,10 +26,12 @@ COLUMNS = {
     },
     "work_request": {
         "source": 6922793410842500,
+        "phase_sheet": 6922793410842500,           # Use if needed in phase sheet
+        "crew_reference": 3499178751545604,        # Update with actual column id for WR # in crew sheet
         "target": 8644216667983748,
     },
     "assigned_resource": {
-        "source": 7828491195862916,
+        "crew_reference": 3430671535795460,        # Update with actual column id for Crew Name in crew sheet
         "target": 1945268683231108,
     },
     "job_placement": {
@@ -97,10 +101,10 @@ class CrewSchedule:
 
 def get_sheet(client, sheet_id):
     rows = []
-    for row in client.Sheets.get_sheet(sheet_id).rows:
+    sheet = client.Sheets.get_sheet(sheet_id)
+    for row in sheet.rows:
         cell_dict = {cell.column_id: cell.value for cell in row.cells}
         cell_dict['row_id'] = row.id
-        cell_dict['parent_id'] = row.parent_id
         rows.append(cell_dict)
     return rows
 
@@ -118,6 +122,16 @@ def get_phase_pole_actuals(phase_poles_rows):
         if row.get(COLUMNS['scope_number']['source_phase']) and row.get(COLUMNS['scope_phase']['source'])
     }
 
+def build_crew_lookup(crew_rows):
+    """Returns {Work Request #: Crew Name}"""
+    lookup = {}
+    for row in crew_rows:
+        wr = row.get(COLUMNS['work_request']['crew_reference'])
+        crew = row.get(COLUMNS['assigned_resource']['crew_reference'])
+        if wr and crew:
+            lookup[wr] = crew
+    return lookup
+
 def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
     results = dict(phase_pole_actuals)
     by_scope = defaultdict(list)
@@ -134,7 +148,7 @@ def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
                 results[(scope, phase)] = per_phase
     return results
 
-def build_crews_and_jobs(target_rows, pole_assignments):
+def build_crews_and_jobs(target_rows, pole_assignments, crew_lookup):
     crews = defaultdict(lambda: CrewSchedule(name=None))
     all_jobs = []
 
@@ -142,7 +156,8 @@ def build_crews_and_jobs(target_rows, pole_assignments):
         scope = row.get(COLUMNS['scope_number']['target'])
         phase = row.get(COLUMNS['scope_phase']['target'])
         wr = row.get(COLUMNS['work_request']['target'])
-        crew = row.get(COLUMNS['assigned_resource']['target']) or PLACEHOLDER_CREW
+        # Lookup by WR #
+        crew = crew_lookup.get(wr, PLACEHOLDER_CREW)
         placement = row.get(COLUMNS['job_placement']['target']) or 9999
         poles = pole_assignments.get((scope, phase)) or 0
         row_id = row['row_id']
@@ -168,10 +183,14 @@ def schedule_crews(crews, crew_start_dates):
 def main():
     client = smartsheet.Smartsheet(API_TOKEN)
 
-    total_poles_rows = get_sheet(client, SHEET_ID_TOTAL_POLES)
-    phase_poles_rows = get_sheet(client, SHEET_ID_PHASE_POLES)
-    target_rows = get_sheet(client, SHEET_ID_TARGET)
+    # 1. Load all sheets
+    total_poles_rows   = get_sheet(client, SHEET_ID_TOTAL_POLES)
+    phase_poles_rows   = get_sheet(client, SHEET_ID_PHASE_POLES)
+    target_rows        = get_sheet(client, SHEET_ID_TARGET)
+    crew_reference_rows = get_sheet(client, SHEET_ID_CREW_REFERENCE)
 
+    # 2. Build lookups
+    crew_lookup = build_crew_lookup(crew_reference_rows)
     scope_totals = get_scope_totals(total_poles_rows)
     phase_pole_actuals = get_phase_pole_actuals(phase_poles_rows)
     all_phases = set()
@@ -182,20 +201,19 @@ def main():
             all_phases.add((scope, phase))
     pole_assignments = allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases)
 
-    crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
-
+    # 3. Build jobs & schedule
+    crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments, crew_lookup)
     crew_start_dates = {crew: datetime.today() for crew in crews}
-    # TODO: Replace with advanced rotation if desired
-
     schedule_crews(crews, crew_start_dates)
 
-    updates = []
+    # 4. Batch update
     valid_col_ids = {
         'pole_count': str(COLUMNS['pole_count_phase']['target']),
         'expected_start': str(COLUMNS['expected_start_date']['target']),
         'expected_end': str(COLUMNS['expected_end_date']['target']),
         'assigned_resource': str(COLUMNS['assigned_resource']['target']),
     }
+    updates = []
     for job in all_jobs:
         update_dict = {
             'row_id': job.row_id,
@@ -204,7 +222,6 @@ def main():
             valid_col_ids['expected_end']: job.expected_end.strftime('%Y-%m-%d') if job.expected_end else None,
             valid_col_ids['assigned_resource']: job.crew,
         }
-        # Only keep entries with valid column ids and not None
         updates.append({k: v for k, v in update_dict.items() if (k == 'row_id' or (k in valid_col_ids.values() and v is not None))})
 
     update_target_sheet(client, SHEET_ID_TARGET, updates)

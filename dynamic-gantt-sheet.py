@@ -4,7 +4,6 @@ Advanced Dynamic Project Scheduler for Smartsheet
 - Handles multiple sheets and advanced schedule logic for crews, phases, and work requests
 - Updates professional Gantt schedule with full hierarchy and cascading logic
 - Fills in placeholders and recalculates all expected/actuals as real data arrives
-- Designed for enterprise use, extensible for advanced business rules
 
 Author: [Your Name/Org]
 """
@@ -13,7 +12,7 @@ import os
 import math
 import smartsheet
 import logging
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 # -------- CONFIGURATION --------
@@ -70,7 +69,7 @@ COLUMNS = {
         "target": 2674900969672580,
     },
     "expected_end_date": {
-        "target": None,
+        "target": 3071168590073732,  # <--- Added your column id here!
     },
 }
 
@@ -121,10 +120,6 @@ def get_sheet(client, sheet_id):
         rows.append(cell_dict)
     return rows
 
-def get_column_map(sheet):
-    """Returns a dict of {column_title: column_id}."""
-    return {col.title: col.id for col in sheet.columns}
-
 # -------- POLE LOGIC --------
 def get_scope_totals(total_poles_rows):
     """Returns {Scope #: total_poles}."""
@@ -151,7 +146,6 @@ def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
 
     for scope, total in scope_totals.items():
         assigned = sum([phase_pole_actuals.get((scope, p), 0) or 0 for p in by_scope[scope]])
-        # Find all phases missing actuals
         unassigned_phases = [p for p in by_scope[scope] if (scope, p) not in phase_pole_actuals]
         if unassigned_phases:
             remainder = (total or 0) - assigned
@@ -164,7 +158,6 @@ def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
 def build_crews_and_jobs(target_rows, pole_assignments):
     """Returns {crew: CrewSchedule} and global job list."""
     crews = defaultdict(lambda: CrewSchedule(name=None))
-    jobs_by_scope_phase = defaultdict(list)
     all_jobs = []
 
     for row in target_rows:
@@ -178,12 +171,11 @@ def build_crews_and_jobs(target_rows, pole_assignments):
 
         job = Job(scope, phase, wr, placement, crew, poles, row_id, is_placeholder=(crew == PLACEHOLDER_CREW))
         all_jobs.append(job)
-        jobs_by_scope_phase[(scope, phase)].append(job)
         if not crews[crew].name:
             crews[crew].name = crew
         crews[crew].add_job(job)
 
-    return crews, jobs_by_scope_phase, all_jobs
+    return crews, all_jobs
 
 def schedule_crews(crews, crew_start_dates):
     """Updates jobs in place with expected_start and expected_end based on scheduling logic."""
@@ -208,7 +200,6 @@ def main():
     # 2. Pole logic: Build assignment table for all phases
     scope_totals = get_scope_totals(total_poles_rows)
     phase_pole_actuals = get_phase_pole_actuals(phase_poles_rows)
-    # Get all (scope, phase) pairs in the target sheet
     all_phases = set()
     for row in target_rows:
         scope = row.get(COLUMNS['scope_number']['target'])
@@ -218,32 +209,33 @@ def main():
     pole_assignments = allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases)
 
     # 3. Build crew schedules and job lists
-    crews, jobs_by_scope_phase, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
+    crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
 
-    # 4. Set crew start dates (example: Thursday start, replace with your own logic)
+    # 4. Set crew start dates (placeholder: all start today; expand with real logic as needed)
     crew_start_dates = {crew: datetime.today() for crew in crews}
-    # TODO: Replace above with real logic for crew rotations (Thursday to Thursday, alternating)
+    # TODO: Replace above with your logic for alternating Thursday start, rotations, etc.
 
     # 5. Dynamic scheduling (jobs shift when jobs are inserted/moved/reassigned)
     schedule_crews(crews, crew_start_dates)
 
-    # 6. Build Smartsheet update list
+    # 6. Build Smartsheet update list, robustly skipping any columns with None
     updates = []
     for job in all_jobs:
-        updates.append({
+        update_dict = {
             'row_id': job.row_id,
             str(COLUMNS['pole_count_phase']['target']): job.poles,
             str(COLUMNS['expected_start_date']['target']): job.expected_start.strftime('%Y-%m-%d') if job.expected_start else None,
             str(COLUMNS['expected_end_date']['target']): job.expected_end.strftime('%Y-%m-%d') if job.expected_end else None,
             str(COLUMNS['assigned_resource']['target']): job.crew,
-        })
+        }
+        # Remove any keys with column_id None (robustness)
+        updates.append({k: v for k, v in update_dict.items() if k != 'row_id' and k != 'None' and v is not None or k == 'row_id'})
 
-    # 7. Batch update Smartsheet
     update_target_sheet(client, SHEET_ID_TARGET, updates)
     logging.info("Smartsheet schedule updated successfully.")
 
 def update_target_sheet(client, sheet_id, updates):
-    """Updates rows in Smartsheet with new values."""
+    """Updates rows in Smartsheet with new values. Skips invalid column IDs."""
     batch = []
     for update in updates:
         row = smartsheet.models.Row()
@@ -252,10 +244,15 @@ def update_target_sheet(client, sheet_id, updates):
         for col_id, val in update.items():
             if col_id == 'row_id':
                 continue
-            row.cells.append({
-                'column_id': int(col_id),
-                'value': val
-            })
+            if col_id is None or col_id == 'None':
+                continue
+            try:
+                row.cells.append({
+                    'column_id': int(col_id),
+                    'value': val
+                })
+            except Exception as e:
+                logging.warning(f"Could not update column {col_id}: {e}")
         batch.append(row)
     if batch:
         client.Sheets.update_rows(sheet_id, batch)

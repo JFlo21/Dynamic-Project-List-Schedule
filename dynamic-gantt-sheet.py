@@ -1,8 +1,8 @@
 """
-Dynamic Gantt Scheduling System - V8.3 (Final & Corrected)
+Dynamic Gantt Scheduling System - V8.4 (Final & Corrected)
 
 - FINAL: Correctly maps "Scope ID #" as the phase identifier to build the full 3-level hierarchy.
-- FIX: Resolved KeyError by stripping whitespace from column titles during mapping, making it more robust.
+- FIX: Replaced non-existent 'add_rows_with_children' with the correct multi-step hierarchy building process.
 - Dynamically discovers all column IDs by name at runtime.
 - Builds the Gantt chart from scratch on each run with full parent-child relationships.
 """
@@ -74,7 +74,6 @@ class Job:
 # -------- CORE LOGIC --------
 def build_column_map(sheet_obj):
     """Creates a dictionary mapping column titles to column IDs, stripping whitespace."""
-    # CORRECTED: Added .strip() to make the mapping robust against whitespace issues.
     return {col.title.strip(): col.id for col in sheet_obj.columns}
 
 def get_cell_value(row, col_map, col_name):
@@ -98,7 +97,7 @@ def aggregate_data_from_sources(client, col_maps):
 
     for row in task_list_sheet.rows:
         scope = get_cell_value(row, task_map, COLUMN_NAMES['source_scope'])
-        phase = get_cell_value(row, task_map, COLUMN_NAMES['source_phase']) # Using corrected phase column
+        phase = get_cell_value(row, task_map, COLUMN_NAMES['source_phase'])
         wr = get_cell_value(row, task_map, COLUMN_NAMES['source_wr'])
         
         if not all([scope, phase, wr]):
@@ -130,7 +129,7 @@ def allocate_poles(client, jobs_by_hierarchy, col_maps):
     }
 
     for scope, phases in jobs_by_hierarchy.items():
-        total_poles = scope_totals.get(scope, 0)
+        total_poles = float(scope_totals.get(scope, 0) or 0)
         if not total_poles: continue
 
         assigned_poles = sum(job.poles for phase in phases.values() for job in phase if job.poles)
@@ -183,26 +182,58 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
         else:
             raise e # Re-raise other API errors
 
-    # 2. Add all rows with hierarchy in a single, efficient call
-    rows_to_add = []
+    # 2. Build the hierarchy level by level
+    scope_to_row_id = {}
+    phase_to_row_id = {}
+
+    # A. Add all Scope (Parent) rows
+    scope_rows_to_add = []
+    for scope_name in sorted(jobs_by_hierarchy.keys()):
+        row = smartsheet.models.Row()
+        row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': scope_name})
+        scope_rows_to_add.append(row)
+    
+    if scope_rows_to_add:
+        added_scopes = client.Sheets.add_rows(SHEET_ID_TARGET, scope_rows_to_add).result
+        for row in added_scopes:
+            scope_to_row_id[row.cells[0].value] = row.id
+        logging.info(f"Added {len(added_scopes)} top-level Scope rows.")
+
+    # B. Add all Phase (Child) rows
     for scope_name, phases in sorted(jobs_by_hierarchy.items()):
-        scope_row = smartsheet.models.Row()
-        scope_row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': scope_name})
+        parent_scope_id = scope_to_row_id.get(scope_name)
+        if not parent_scope_id: continue
+
+        phase_rows_to_add = []
+        for phase_name in sorted(phases.keys()):
+            row = smartsheet.models.Row()
+            row.parent_id = parent_scope_id
+            row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': phase_name})
+            phase_rows_to_add.append(row)
         
-        phase_rows = []
+        if phase_rows_to_add:
+            added_phases = client.Sheets.add_rows(SHEET_ID_TARGET, phase_rows_to_add).result
+            for i, row in enumerate(added_phases):
+                phase_key = (parent_scope_id, row.cells[0].value)
+                phase_to_row_id[phase_key] = row.id
+            logging.info(f"Added {len(added_phases)} Phase rows for Scope '{scope_name}'.")
+
+    # C. Add all Work Request (Grandchild) rows
+    for scope_name, phases in sorted(jobs_by_hierarchy.items()):
+        parent_scope_id = scope_to_row_id.get(scope_name)
+        if not parent_scope_id: continue
+
         for phase_name, jobs in sorted(phases.items()):
-            phase_row = smartsheet.models.Row()
-            phase_row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': phase_name})
-            
-            wr_rows = []
+            parent_phase_id = phase_to_row_id.get((parent_scope_id, phase_name))
+            if not parent_phase_id: continue
+
+            wr_rows_to_add = []
             for job in sorted(jobs, key=lambda j: j.placement):
                 wr_row = smartsheet.models.Row()
+                wr_row.parent_id = parent_phase_id
                 
-                # Populate all cells for the work request
                 cells = [
-                    # The name of the WR goes in the primary column
                     {'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': job.wr},
-                    # Add data to other dedicated columns for reporting
                     {'column_id': target_map[COLUMN_NAMES['target_scope']], 'value': job.scope},
                     {'column_id': target_map[COLUMN_NAMES['target_phase']], 'value': job.phase},
                     {'column_id': target_map[COLUMN_NAMES['target_wr']], 'value': job.wr},
@@ -216,17 +247,13 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
                 if job.end_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_end']], 'value': job.end_date.strftime('%Y-%m-%d')})
                 
                 wr_row.cells = cells
-                wr_rows.append(wr_row)
-            
-            phase_row.children = wr_rows
-            phase_rows.append(phase_row)
-        
-        scope_row.children = phase_rows
-        rows_to_add.append(scope_row)
+                wr_rows_to_add.append(wr_row)
 
-    if rows_to_add:
-        client.Sheets.add_rows_with_children(SHEET_ID_TARGET, rows_to_add)
-        logging.info(f"Successfully built Gantt chart with {len(rows_to_add)} top-level scopes.")
+            if wr_rows_to_add:
+                client.Sheets.add_rows(SHEET_ID_TARGET, wr_rows_to_add)
+    
+    logging.info("Finished adding all Work Request rows.")
+
 
 def main():
     """Main workflow to run the entire scheduling and building process."""

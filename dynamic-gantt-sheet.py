@@ -1,7 +1,8 @@
 """
-Dynamic Gantt Scheduling System - V8 (Final Hierarchy)
+Dynamic Gantt Scheduling System - V8.1 (Final & Corrected)
 
 - FINAL: Correctly maps "Scope ID #" as the phase identifier to build the full 3-level hierarchy.
+- FIX: Removed invalid 'ignore_errors' argument from delete_rows call to resolve TypeError.
 - Dynamically discovers all column IDs by name at runtime.
 - Builds the Gantt chart from scratch on each run with full parent-child relationships.
 """
@@ -172,10 +173,14 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
     try:
         sheet = client.Sheets.get_sheet(SHEET_ID_TARGET)
         if sheet.rows:
-            client.Sheets.delete_rows(SHEET_ID_TARGET, [r.id for r in sheet.rows], ignore_errors=True)
+            # CORRECTED LINE: Removed the invalid 'ignore_errors' argument
+            client.Sheets.delete_rows(SHEET_ID_TARGET, [r.id for r in sheet.rows])
             logging.info(f"Deleted existing rows from target sheet.")
-    except smartsheet.exceptions.ApiError:
-        logging.info("Target sheet is empty or not found. Proceeding to build.")
+    except smartsheet.exceptions.ApiError as e:
+        if e.error.error_code == 1006: # Sheet not found is okay
+             logging.info("Target sheet is empty or not found. Proceeding to build.")
+        else:
+            raise e # Re-raise other API errors
 
     # 2. Add all rows with hierarchy in a single, efficient call
     rows_to_add = []

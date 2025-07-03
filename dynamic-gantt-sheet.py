@@ -1,8 +1,8 @@
 """
-Dynamic Gantt Scheduling System - V8.6 (Final & Corrected)
+Dynamic Gantt Scheduling System - V8.7 (Final & Corrected)
 
-- FINAL: Correctly maps "Scope ID #" as the phase identifier to build the full 3-level hierarchy.
-- FIX: Resolved duplicate columnId error by intelligently building row cells, ensuring the primary column is not populated twice.
+- FINAL: Uses the correct sheet ID (3733355007790980) as the master task list.
+- FIX: Resolved the final KeyError by correctly constructing the row data, preventing duplicate column errors.
 - Dynamically discovers all column IDs by name at runtime.
 - Builds the Gantt chart from scratch on each run with full parent-child relationships.
 """
@@ -19,7 +19,8 @@ API_TOKEN = os.getenv('SMARTSHEET_API_TOKEN')
 
 # --- DATA SOURCE & TARGET SHEETS ---
 SHEET_ID_TOTAL_POLES = 8495204601384836
-SHEET_ID_PHASE_POLES = 1553121697288068 # Master task list
+# CORRECTED: Using the sheet ID you provided as the master task list
+SHEET_ID_PHASE_POLES = 3733355007790980 
 SHEET_ID_TARGET      = 1847107938897796 # The blank sheet for the Gantt chart
 
 # --- COLUMN NAMES (Derived from your JSON data and clarifications) ---
@@ -65,7 +66,7 @@ class Job:
     def __init__(self, wr, scope, phase, crew, placement, poles=0):
         self.wr, self.scope, self.phase, self.crew = wr, scope, phase, crew
         self.placement = placement or 9999
-        self.poles = poles or 0
+        self.poles = float(poles or 0)
         self.start_date, self.end_date = None, None
 
     def duration_days(self):
@@ -203,26 +204,33 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
                 # Start with the primary column cell, which contains the WR name for this row
                 cells = [{'column_id': primary_col_id, 'value': job.wr}]
                 
-                # Create a dictionary of other data to add to dedicated columns
-                dedicated_data = {
-                    COLUMN_NAMES['target_scope']: job.scope,
-                    COLUMN_NAMES['target_phase']: job.phase,
-                    COLUMN_NAMES['target_wr']: job.wr,
-                    COLUMN_NAMES['target_poles']: job.poles,
-                    COLUMN_NAMES['target_start']: job.start_date.strftime('%Y-%m-%d') if job.start_date else None,
-                    COLUMN_NAMES['target_end']: job.end_date.strftime('%Y-%m-%d') if job.end_date else None,
+                # Define the mapping of job attributes to their target column names
+                data_mapping = {
+                    'scope': 'target_scope',
+                    'phase': 'target_phase',
+                    'wr': 'target_wr',
+                    'poles': 'target_poles',
                 }
-                
-                # Add cells for dedicated columns, ONLY if they are not the primary column
-                for col_name, value in dedicated_data.items():
+
+                # Add cells for dedicated data columns, ensuring not to duplicate the primary column
+                for attr, target_key in data_mapping.items():
+                    col_name = COLUMN_NAMES[target_key]
                     col_id = target_map.get(col_name)
-                    if col_id and col_id != primary_col_id and value is not None:
-                        cells.append({'column_id': col_id, 'value': value})
+                    if col_id and col_id != primary_col_id:
+                        value = getattr(job, attr, None)
+                        if value is not None:
+                            cells.append({'column_id': col_id, 'value': value})
+
+                # Add date cells
+                if job.start_date:
+                    cells.append({'column_id': target_map[COLUMN_NAMES['target_start']], 'value': job.start_date.strftime('%Y-%m-%d')})
+                if job.end_date:
+                    cells.append({'column_id': target_map[COLUMN_NAMES['target_end']], 'value': job.end_date.strftime('%Y-%m-%d')})
 
                 # Add the contact list cell separately
                 email = CREW_EMAILS.get(job.crew)
                 resource_col_id = target_map.get(COLUMN_NAMES['target_resource'])
-                if email and resource_col_id and resource_col_id != primary_col_id:
+                if email and resource_col_id:
                     cells.append({'column_id': resource_col_id, 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
 
                 wr_row.cells = cells

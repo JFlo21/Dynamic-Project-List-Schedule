@@ -1,8 +1,8 @@
 """
-Dynamic Gantt Scheduling System - V8.2 (Final & Corrected)
+Dynamic Gantt Scheduling System - V8.3 (Final & Corrected)
 
 - FINAL: Correctly maps "Scope ID #" as the phase identifier to build the full 3-level hierarchy.
-- FIX: Resolved KeyError by adding the missing 'target_scope' to the column name dictionary.
+- FIX: Resolved KeyError by stripping whitespace from column titles during mapping, making it more robust.
 - Dynamically discovers all column IDs by name at runtime.
 - Builds the Gantt chart from scratch on each run with full parent-child relationships.
 """
@@ -40,7 +40,7 @@ COLUMN_NAMES = {
     "target_scope": "Scope #",   # This is the dedicated column for scope reporting
     "target_phase": "Scope Phase #",
     "target_wr": "Work Request #",
-    "target_resource": "Assigned Resource ", # Note the trailing space from your JSON
+    "target_resource": "Assigned Resource", # Trailing space removed for consistency
     "target_placement": "Job Placement",
     "target_poles": "Pole Count (Days)",
     "target_start": "Expected Start Date",
@@ -73,8 +73,9 @@ class Job:
 
 # -------- CORE LOGIC --------
 def build_column_map(sheet_obj):
-    """Creates a dictionary mapping column titles to column IDs."""
-    return {col.title: col.id for col in sheet_obj.columns}
+    """Creates a dictionary mapping column titles to column IDs, stripping whitespace."""
+    # CORRECTED: Added .strip() to make the mapping robust against whitespace issues.
+    return {col.title.strip(): col.id for col in sheet_obj.columns}
 
 def get_cell_value(row, col_map, col_name):
     """Safely gets a cell's value using the dynamic column map."""

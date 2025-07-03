@@ -1,8 +1,8 @@
 """
-Dynamic Gantt Scheduling System - V8.1 (Final & Corrected)
+Dynamic Gantt Scheduling System - V8.2 (Final & Corrected)
 
 - FINAL: Correctly maps "Scope ID #" as the phase identifier to build the full 3-level hierarchy.
-- FIX: Removed invalid 'ignore_errors' argument from delete_rows call to resolve TypeError.
+- FIX: Resolved KeyError by adding the missing 'target_scope' to the column name dictionary.
 - Dynamically discovers all column IDs by name at runtime.
 - Builds the Gantt chart from scratch on each run with full parent-child relationships.
 """
@@ -37,6 +37,7 @@ COLUMN_NAMES = {
     
     # Names for the columns in the final target Gantt sheet
     "target_primary": "Scope #", # This is the primary column
+    "target_scope": "Scope #",   # This is the dedicated column for scope reporting
     "target_phase": "Scope Phase #",
     "target_wr": "Work Request #",
     "target_resource": "Assigned Resource ", # Note the trailing space from your JSON
@@ -173,7 +174,6 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
     try:
         sheet = client.Sheets.get_sheet(SHEET_ID_TARGET)
         if sheet.rows:
-            # CORRECTED LINE: Removed the invalid 'ignore_errors' argument
             client.Sheets.delete_rows(SHEET_ID_TARGET, [r.id for r in sheet.rows])
             logging.info(f"Deleted existing rows from target sheet.")
     except smartsheet.exceptions.ApiError as e:

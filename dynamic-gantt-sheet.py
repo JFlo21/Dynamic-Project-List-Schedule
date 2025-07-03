@@ -1,10 +1,10 @@
 """
-Dynamic Gantt Scheduling System - V8.7 (Final & Corrected)
+Dynamic Gantt Scheduling System - V9 (Multi-Sheet Aggregation)
 
-- FINAL: Uses the correct sheet ID (3733355007790980) as the master task list.
-- FIX: Resolved the final KeyError by correctly constructing the row data, preventing duplicate column errors.
-- Dynamically discovers all column IDs by name at runtime.
-- Builds the Gantt chart from scratch on each run with full parent-child relationships.
+- FINAL & CORRECTED: Implements a full multi-sheet data aggregation strategy.
+- It now correctly uses the 'Work Request #' to look up and join data from all source sheets.
+- The logic correctly sources Scope, Phase, WR, Resources, and Pole Counts from their respective sheets.
+- Builds the full 3-level hierarchy from scratch on each run.
 """
 
 import os
@@ -18,30 +18,33 @@ from datetime import datetime, timedelta
 API_TOKEN = os.getenv('SMARTSHEET_API_TOKEN')
 
 # --- DATA SOURCE & TARGET SHEETS ---
-SHEET_ID_TOTAL_POLES = 8495204601384836
-# CORRECTED: Using the sheet ID you provided as the master task list
-SHEET_ID_PHASE_POLES = 3733355007790980 
-SHEET_ID_TARGET      = 1847107938897796 # The blank sheet for the Gantt chart
+SHEET_ID_MASTER_TASK_LIST = 1553121697288068 # The primary source for the list of all tasks
+SHEET_ID_RESOURCE_LOOKUP = 3733355007790980  # The source for resource assignments
+SHEET_ID_TOTAL_POLES = 8495204601384836      # The source for high-level pole counts
+SHEET_ID_TARGET = 1847107938897796           # The blank sheet for the Gantt chart
 
 # --- COLUMN NAMES (Derived from your JSON data and clarifications) ---
 COLUMN_NAMES = {
-    # Names for the master task list (SHEET_ID_PHASE_POLES)
-    "source_scope": "Scope #",
-    "source_phase": "Scope ID #", # Corrected mapping for the phase level
-    "source_wr": "Work Request #",
-    "source_poles": "Total Poles",
-    "source_resource": "Foreman Assigned + General Foreman",
+    # Names for the master task list (SHEET_ID_MASTER_TASK_LIST)
+    "task_scope": "Scope #",
+    "task_phase": "Scope ID #", # This is the Scope Phase #
+    "task_wr": "Work Request #",
+    "task_poles": "Total Poles", # Specific pole count for the task, if available
+
+    # Names for the resource lookup sheet (SHEET_ID_RESOURCE_LOOKUP)
+    "lookup_wr": "Work Request #", # This is the key to match on
+    "lookup_resource": "Foreman Assigned + General Foreman", # This is the value to get
     
     # Names for the total poles sheet
-    "total_poles_scope": "Job ID",
+    "total_poles_scope": "Job ID", # This is the Scope # on this sheet
     "total_poles_count": "total # poles on the project to instal wire on",
     
     # Names for the columns in the final target Gantt sheet
-    "target_primary": "Scope #", # This is the primary column
-    "target_scope": "Scope #",   # This is the dedicated column for scope reporting
+    "target_primary": "Work Request #", # The primary column will now be WR # for clarity
+    "target_scope": "Scope #",
     "target_phase": "Scope Phase #",
     "target_wr": "Work Request #",
-    "target_resource": "Assigned Resource", # Trailing space removed for consistency
+    "target_resource": "Assigned Resource",
     "target_placement": "Job Placement",
     "target_poles": "Pole Count (Days)",
     "target_start": "Expected Start Date",
@@ -87,62 +90,80 @@ def get_cell_value(row, col_map, col_name):
         return cell.object_value.name
     return cell.value
 
-def aggregate_data_from_sources(client, col_maps):
-    """Reads source sheets and builds a hierarchical dictionary of all jobs."""
-    logging.info("Aggregating data from source sheets...")
-    task_list_sheet = client.Sheets.get_sheet(SHEET_ID_PHASE_POLES, include=['objectValue'])
-    task_map = col_maps['phase_poles']
+def build_lookup_maps(client, col_maps):
+    """Builds lookup dictionaries from the resource and total poles sheets."""
+    logging.info("Building lookup maps...")
     
-    jobs_by_hierarchy = defaultdict(lambda: defaultdict(list))
-    all_jobs = []
+    # Resource Lookup Map: {WR # -> Resource Name}
+    resource_sheet = client.Sheets.get_sheet(SHEET_ID_RESOURCE_LOOKUP, include=['objectValue'])
+    resource_map = col_maps['resource_lookup']
+    wr_to_resource = {
+        get_cell_value(row, resource_map, COLUMN_NAMES['lookup_wr']): get_cell_value(row, resource_map, COLUMN_NAMES['lookup_resource'])
+        for row in resource_sheet.rows
+    }
 
+    # Total Poles Lookup Map: {Scope # -> Total Poles}
+    total_poles_sheet = client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)
+    total_poles_map = col_maps['total_poles']
+    scope_to_poles = {
+        get_cell_value(row, total_poles_map, COLUMN_NAMES['total_poles_scope']): float(get_cell_value(row, total_poles_map, COLUMN_NAMES['total_poles_count']) or 0)
+        for row in total_poles_sheet.rows
+    }
+    
+    logging.info(f"Built resource map for {len(wr_to_resource)} WRs and pole map for {len(scope_to_poles)} scopes.")
+    return wr_to_resource, scope_to_poles
+
+def aggregate_data(client, col_maps, wr_to_resource):
+    """Reads the master task list and enriches it with data from the lookup maps."""
+    logging.info("Aggregating data from master task list...")
+    task_list_sheet = client.Sheets.get_sheet(SHEET_ID_MASTER_TASK_LIST)
+    task_map = col_maps['task_list']
+    
+    all_jobs = []
     for row in task_list_sheet.rows:
-        scope = get_cell_value(row, task_map, COLUMN_NAMES['source_scope'])
-        phase = get_cell_value(row, task_map, COLUMN_NAMES['source_phase'])
-        wr = get_cell_value(row, task_map, COLUMN_NAMES['source_wr'])
+        wr = get_cell_value(row, task_map, COLUMN_NAMES['task_wr'])
+        if not wr: continue
+
+        scope = get_cell_value(row, task_map, COLUMN_NAMES['task_scope'])
+        phase = get_cell_value(row, task_map, COLUMN_NAMES['task_phase'])
         
-        if not all([scope, phase, wr]):
-            logging.warning(f"Skipping row {row.row_number} due to missing Scope, Phase, or WR.")
+        if not all([scope, phase]):
+            logging.warning(f"Skipping WR '{wr}' due to missing Scope or Phase.")
             continue
 
         job = Job(
             wr=wr, scope=scope, phase=phase,
-            crew=get_cell_value(row, task_map, COLUMN_NAMES['source_resource']) or PLACEHOLDER_CREW,
+            crew=wr_to_resource.get(wr) or PLACEHOLDER_CREW,
             placement=get_cell_value(row, task_map, COLUMN_NAMES['target_placement']),
-            poles=get_cell_value(row, task_map, COLUMN_NAMES['source_poles'])
+            poles=get_cell_value(row, task_map, COLUMN_NAMES['task_poles'])
         )
-        jobs_by_hierarchy[scope][phase].append(job)
         all_jobs.append(job)
         
-    logging.info(f"Aggregated {len(all_jobs)} total jobs into a 3-level hierarchy.")
-    return jobs_by_hierarchy, all_jobs
+    logging.info(f"Aggregated {len(all_jobs)} total jobs.")
+    return all_jobs
 
-def allocate_poles(client, jobs_by_hierarchy, col_maps):
-    """Allocates pole counts for phases with missing values."""
-    if not jobs_by_hierarchy: return
+def allocate_poles(all_jobs, scope_to_poles):
+    """Allocates pole counts for jobs with missing values."""
+    if not all_jobs: return
     logging.info("Allocating pole counts...")
     
-    total_poles_sheet = client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)
-    total_poles_map = col_maps['total_poles']
-    scope_totals = {
-        row.get_column(total_poles_map[COLUMN_NAMES['total_poles_scope']]).value: float(row.get_column(total_poles_map[COLUMN_NAMES['total_poles_count']]).value or 0)
-        for row in total_poles_sheet.rows if row.get_column(total_poles_map[COLUMN_NAMES['total_poles_scope']])
-    }
+    jobs_by_scope = defaultdict(list)
+    for job in all_jobs:
+        jobs_by_scope[job.scope].append(job)
 
-    for scope, phases in jobs_by_hierarchy.items():
-        total_poles = scope_totals.get(scope, 0)
+    for scope, jobs in jobs_by_scope.items():
+        total_poles = scope_to_poles.get(scope, 0)
         if not total_poles: continue
 
-        assigned_poles = sum(job.poles for phase in phases.values() for job in phase if job.poles)
-        phases_with_unknown_poles = [phase for phase, jobs in phases.items() if not any(j.poles for j in jobs)]
-
-        if phases_with_unknown_poles:
+        assigned_poles = sum(job.poles for job in jobs if job.poles)
+        jobs_to_allocate = [job for job in jobs if not job.poles]
+        
+        if jobs_to_allocate:
             remaining_poles = total_poles - assigned_poles
             if remaining_poles > 0:
-                poles_per_phase = int(math.ceil(remaining_poles / len(phases_with_unknown_poles)))
-                for phase_name in phases_with_unknown_poles:
-                    for job in jobs_by_hierarchy[scope][phase_name]:
-                        job.poles = poles_per_phase
+                poles_per_job = int(math.ceil(remaining_poles / len(jobs_to_allocate)))
+                for job in jobs_to_allocate:
+                    job.poles = poles_per_job
 
 def perform_scheduling(all_jobs):
     """Calculates cascading start/end dates."""
@@ -162,28 +183,26 @@ def perform_scheduling(all_jobs):
                 job.end_date = current_date + timedelta(days=duration - 1)
                 current_date = job.end_date + timedelta(days=1)
 
-def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
-    """Builds a 3-level Gantt chart (Scope > Phase > WR) from scratch in a single API call."""
-    if not jobs_by_hierarchy:
+def build_gantt_from_scratch(client, all_jobs, col_maps):
+    """Builds a 3-level Gantt chart from scratch in a single API call."""
+    if not all_jobs:
         logging.warning("No data to build. Gantt sheet will be empty.")
         return
         
     logging.info(f"Rebuilding Gantt chart on sheet ID {SHEET_ID_TARGET}...")
     target_map = col_maps['target']
     
-    # 1. Clear the sheet
     try:
         sheet = client.Sheets.get_sheet(SHEET_ID_TARGET)
         if sheet.rows:
             client.Sheets.delete_rows(SHEET_ID_TARGET, [r.id for r in sheet.rows])
-            logging.info(f"Deleted existing rows from target sheet.")
     except smartsheet.exceptions.ApiError as e:
-        if e.error.error_code == 1006: # Sheet not found is okay
-             logging.info("Target sheet is empty or not found. Proceeding to build.")
-        else:
-            raise e # Re-raise other API errors
+        if e.error.error_code != 1006: raise e
 
-    # 2. Build the entire nested row structure in memory first.
+    jobs_by_hierarchy = defaultdict(lambda: defaultdict(list))
+    for job in all_jobs:
+        jobs_by_hierarchy[job.scope][job.phase].append(job)
+
     rows_to_add = []
     for scope_name, phases in sorted(jobs_by_hierarchy.items()):
         scope_row = smartsheet.models.Row()
@@ -197,41 +216,21 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
             wr_rows = []
             for job in sorted(jobs, key=lambda j: j.placement):
                 wr_row = smartsheet.models.Row()
-                
-                # --- CORRECTED LOGIC TO PREVENT DUPLICATE COLUMN ID ---
                 primary_col_id = target_map[COLUMN_NAMES['target_primary']]
-                
-                # Start with the primary column cell, which contains the WR name for this row
                 cells = [{'column_id': primary_col_id, 'value': job.wr}]
                 
-                # Define the mapping of job attributes to their target column names
-                data_mapping = {
-                    'scope': 'target_scope',
-                    'phase': 'target_phase',
-                    'wr': 'target_wr',
-                    'poles': 'target_poles',
-                }
-
-                # Add cells for dedicated data columns, ensuring not to duplicate the primary column
-                for attr, target_key in data_mapping.items():
-                    col_name = COLUMN_NAMES[target_key]
-                    col_id = target_map.get(col_name)
+                data_mapping = { 'scope': 'target_scope', 'phase': 'target_phase', 'wr': 'target_wr', 'poles': 'target_poles' }
+                for attr, key in data_mapping.items():
+                    col_id = target_map.get(COLUMN_NAMES[key])
                     if col_id and col_id != primary_col_id:
                         value = getattr(job, attr, None)
-                        if value is not None:
-                            cells.append({'column_id': col_id, 'value': value})
+                        if value is not None: cells.append({'column_id': col_id, 'value': value})
 
-                # Add date cells
-                if job.start_date:
-                    cells.append({'column_id': target_map[COLUMN_NAMES['target_start']], 'value': job.start_date.strftime('%Y-%m-%d')})
-                if job.end_date:
-                    cells.append({'column_id': target_map[COLUMN_NAMES['target_end']], 'value': job.end_date.strftime('%Y-%m-%d')})
+                if job.start_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_start']], 'value': job.start_date.strftime('%Y-%m-%d')})
+                if job.end_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_end']], 'value': job.end_date.strftime('%Y-%m-%d')})
 
-                # Add the contact list cell separately
                 email = CREW_EMAILS.get(job.crew)
-                resource_col_id = target_map.get(COLUMN_NAMES['target_resource'])
-                if email and resource_col_id:
-                    cells.append({'column_id': resource_col_id, 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
+                if email: cells.append({'column_id': target_map[COLUMN_NAMES['target_resource']], 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
 
                 wr_row.cells = cells
                 wr_rows.append(wr_row)
@@ -242,11 +241,9 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
         scope_row.children = phase_rows
         rows_to_add.append(scope_row)
 
-    # 3. Add all rows and their children in a single, efficient API call.
     if rows_to_add:
         client.Sheets.add_rows(SHEET_ID_TARGET, rows_to_add)
-        logging.info(f"Successfully sent request to build Gantt chart with {len(rows_to_add)} top-level scopes.")
-
+        logging.info(f"Successfully sent request to build Gantt chart.")
 
 def main():
     """Main workflow to run the entire scheduling and building process."""
@@ -257,7 +254,8 @@ def main():
     try:
         col_maps = {
             'total_poles': build_column_map(client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)),
-            'phase_poles': build_column_map(client.Sheets.get_sheet(SHEET_ID_PHASE_POLES)),
+            'task_list': build_column_map(client.Sheets.get_sheet(SHEET_ID_MASTER_TASK_LIST)),
+            'resource_lookup': build_column_map(client.Sheets.get_sheet(SHEET_ID_RESOURCE_LOOKUP)),
             'target': build_column_map(client.Sheets.get_sheet(SHEET_ID_TARGET)),
         }
     except Exception as e:
@@ -265,10 +263,11 @@ def main():
         return
     logging.info("Column maps built successfully.")
 
-    jobs_by_hierarchy, all_jobs = aggregate_data_from_sources(client, col_maps)
-    allocate_poles(client, jobs_by_hierarchy, col_maps)
+    wr_to_resource, scope_to_poles = build_lookup_maps(client, col_maps)
+    all_jobs = aggregate_data(client, col_maps, wr_to_resource)
+    allocate_poles(all_jobs, scope_to_poles)
     perform_scheduling(all_jobs)
-    build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps)
+    build_gantt_from_scratch(client, all_jobs, col_maps)
 
 if __name__ == "__main__":
     main()

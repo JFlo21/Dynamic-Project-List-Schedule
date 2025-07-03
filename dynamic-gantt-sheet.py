@@ -1,12 +1,3 @@
-"""
-Dynamic Gantt Scheduling System - V9 (Multi-Sheet Aggregation)
-
-- FINAL & CORRECTED: Implements a full multi-sheet data aggregation strategy.
-- It now correctly uses the 'Work Request #' to look up and join data from all source sheets.
-- The logic correctly sources Scope, Phase, WR, Resources, and Pole Counts from their respective sheets.
-- Builds the full 3-level hierarchy from scratch on each run.
-"""
-
 import os
 import math
 import smartsheet
@@ -17,257 +8,229 @@ from datetime import datetime, timedelta
 # -------- CONFIGURATION --------
 API_TOKEN = os.getenv('SMARTSHEET_API_TOKEN')
 
-# --- DATA SOURCE & TARGET SHEETS ---
-SHEET_ID_MASTER_TASK_LIST = 1553121697288068 # The primary source for the list of all tasks
-SHEET_ID_RESOURCE_LOOKUP = 3733355007790980  # The source for resource assignments
-SHEET_ID_TOTAL_POLES = 8495204601384836      # The source for high-level pole counts
-SHEET_ID_TARGET = 1847107938897796           # The blank sheet for the Gantt chart
+SHEET_ID_TOTAL_POLES = 8495204601384836
+SHEET_ID_PHASE_POLES = 1553121697288068
+SHEET_ID_TARGET      = 1847107938897796
 
-# --- COLUMN NAMES (Derived from your JSON data and clarifications) ---
-COLUMN_NAMES = {
-    # Names for the master task list (SHEET_ID_MASTER_TASK_LIST)
-    "task_scope": "Scope #",
-    "task_phase": "Scope ID #", # This is the Scope Phase #
-    "task_wr": "Work Request #",
-    "task_poles": "Total Poles", # Specific pole count for the task, if available
-
-    # Names for the resource lookup sheet (SHEET_ID_RESOURCE_LOOKUP)
-    "lookup_wr": "Work Request #", # This is the key to match on
-    "lookup_resource": "Foreman Assigned + General Foreman", # This is the value to get
-    
-    # Names for the total poles sheet
-    "total_poles_scope": "Job ID", # This is the Scope # on this sheet
-    "total_poles_count": "total # poles on the project to instal wire on",
-    
-    # Names for the columns in the final target Gantt sheet
-    "target_primary": "Work Request #", # The primary column will now be WR # for clarity
-    "target_scope": "Scope #",
-    "target_phase": "Scope Phase #",
-    "target_wr": "Work Request #",
-    "target_resource": "Assigned Resource",
-    "target_placement": "Job Placement",
-    "target_poles": "Pole Count (Days)",
-    "target_start": "Expected Start Date",
-    "target_end": "Expected End Date"
+COLUMNS = {
+    "scope_number": {
+        "source_total": 3784709278224260,
+        "source_phase": 3784709278224260,
+        "target": 6392416854298500,
+    },
+    "scope_phase": {
+        "source": 1865904432041860,
+        "target": 4140617040613252,
+    },
+    "work_request": {
+        "source": 6922793410842500,
+        "target": 8644216667983748,
+    },
+    "assigned_resource": {
+        "source": 7828491195862916,
+        "target": 1945268683231108,
+    },
+    "job_placement": {
+        "target": 7574768217444228,
+    },
+    "start_date_actual": {
+        "source": 1089957554507652,
+        "target": 481442343374724,
+    },
+    "expected_start_date": {
+        "source": 4568417128107908,
+        "target": 819368776388484,
+    },
+    "end_date_actual": {
+        "source": 503555305459588,
+        "target": 503555305459588,
+    },
+    "percent_complete": {
+        "source": 1044421535289220,
+        "target": 6448868310601604,
+    },
+    "pole_count_total": {
+        "source": 2795493429825412,
+    },
+    "pole_count_phase": {
+        "source": 2674900969672580,
+        "target": 2674900969672580,
+    },
+    "expected_end_date": {
+        "target": 3071168590073732,
+    },
 }
 
-# --- EMAILS FOR CONTACT OBJECTS ---
-CREW_EMAILS = {
-    "Crew A": "crew.a@yourcompany.com",
-    "Ramp-Up Crew (Estimate)": "placeholder.crew@yourcompany.com"
-}
-
-# --- BUSINESS LOGIC ---
 POLES_PER_DAY = 1.2
 PLACEHOLDER_CREW = "Ramp-Up Crew (Estimate)"
 
-# -------- LOGGING --------
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
-# -------- DATA STRUCTURES --------
 class Job:
-    def __init__(self, wr, scope, phase, crew, placement, poles=0):
-        self.wr, self.scope, self.phase, self.crew = wr, scope, phase, crew
-        self.placement = placement or 9999
-        self.poles = float(poles or 0)
-        self.start_date, self.end_date = None, None
+    def __init__(self, scope, phase, wr, placement, crew, poles, row_id, is_placeholder=False):
+        self.scope = scope
+        self.phase = phase
+        self.wr = wr
+        self.placement = placement
+        self.crew = crew
+        self.poles = poles
+        self.row_id = row_id
+        self.is_placeholder = is_placeholder
+        self.expected_start = None
+        self.expected_end = None
 
-    def duration_days(self):
-        return int(math.ceil(self.poles / POLES_PER_DAY)) if self.poles > 0 else 0
+    def duration(self):
+        return int(math.ceil(float(self.poles) / POLES_PER_DAY)) if self.poles else 0
 
-# -------- CORE LOGIC --------
-def build_column_map(sheet_obj):
-    """Creates a dictionary mapping column titles to column IDs, stripping whitespace."""
-    return {col.title.strip(): col.id for col in sheet_obj.columns}
+class CrewSchedule:
+    def __init__(self, name):
+        self.name = name
+        self.jobs = []
 
-def get_cell_value(row, col_map, col_name):
-    """Safely gets a cell's value using the dynamic column map."""
-    col_id = col_map.get(col_name)
-    if not col_id: return None
-    cell = row.get_column(col_id)
-    if not cell or cell.value is None: return None
-    if cell.object_value and hasattr(cell.object_value, 'name'):
-        return cell.object_value.name
-    return cell.value
+    def add_job(self, job):
+        self.jobs.append(job)
+        self.jobs.sort(key=lambda j: j.placement if j.placement is not None else 9999)
 
-def build_lookup_maps(client, col_maps):
-    """Builds lookup dictionaries from the resource and total poles sheets."""
-    logging.info("Building lookup maps...")
-    
-    # Resource Lookup Map: {WR # -> Resource Name}
-    resource_sheet = client.Sheets.get_sheet(SHEET_ID_RESOURCE_LOOKUP, include=['objectValue'])
-    resource_map = col_maps['resource_lookup']
-    wr_to_resource = {
-        get_cell_value(row, resource_map, COLUMN_NAMES['lookup_wr']): get_cell_value(row, resource_map, COLUMN_NAMES['lookup_resource'])
-        for row in resource_sheet.rows
+def get_sheet(client, sheet_id):
+    rows = []
+    for row in client.Sheets.get_sheet(sheet_id).rows:
+        cell_dict = {cell.column_id: cell.value for cell in row.cells}
+        cell_dict['row_id'] = row.id
+        cell_dict['parent_id'] = row.parent_id
+        rows.append(cell_dict)
+    return rows
+
+def get_scope_totals(total_poles_rows):
+    return {
+        row.get(COLUMNS['scope_number']['source_total']): row.get(COLUMNS['pole_count_total']['source'])
+        for row in total_poles_rows if row.get(COLUMNS['scope_number']['source_total'])
     }
 
-    # Total Poles Lookup Map: {Scope # -> Total Poles}
-    total_poles_sheet = client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)
-    total_poles_map = col_maps['total_poles']
-    scope_to_poles = {
-        get_cell_value(row, total_poles_map, COLUMN_NAMES['total_poles_scope']): float(get_cell_value(row, total_poles_map, COLUMN_NAMES['total_poles_count']) or 0)
-        for row in total_poles_sheet.rows
+def get_phase_pole_actuals(phase_poles_rows):
+    return {
+        (row.get(COLUMNS['scope_number']['source_phase']), row.get(COLUMNS['scope_phase']['source'])):
+        row.get(COLUMNS['pole_count_phase']['source'])
+        for row in phase_poles_rows
+        if row.get(COLUMNS['scope_number']['source_phase']) and row.get(COLUMNS['scope_phase']['source'])
     }
-    
-    logging.info(f"Built resource map for {len(wr_to_resource)} WRs and pole map for {len(scope_to_poles)} scopes.")
-    return wr_to_resource, scope_to_poles
 
-def aggregate_data(client, col_maps, wr_to_resource):
-    """Reads the master task list and enriches it with data from the lookup maps."""
-    logging.info("Aggregating data from master task list...")
-    task_list_sheet = client.Sheets.get_sheet(SHEET_ID_MASTER_TASK_LIST)
-    task_map = col_maps['task_list']
-    
+def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
+    results = dict(phase_pole_actuals)
+    by_scope = defaultdict(list)
+    for (scope, phase) in all_phases:
+        by_scope[scope].append(phase)
+
+    for scope, total in scope_totals.items():
+        assigned = sum([float(phase_pole_actuals.get((scope, p), 0) or 0) for p in by_scope[scope]])
+        unassigned_phases = [p for p in by_scope[scope] if (scope, p) not in phase_pole_actuals]
+        if unassigned_phases:
+            remainder = (float(total) or 0) - assigned
+            per_phase = int(math.ceil(remainder / len(unassigned_phases))) if len(unassigned_phases) > 0 else 0
+            for phase in unassigned_phases:
+                results[(scope, phase)] = per_phase
+    return results
+
+def build_crews_and_jobs(target_rows, pole_assignments):
+    crews = defaultdict(lambda: CrewSchedule(name=None))
     all_jobs = []
-    for row in task_list_sheet.rows:
-        wr = get_cell_value(row, task_map, COLUMN_NAMES['task_wr'])
-        if not wr: continue
 
-        scope = get_cell_value(row, task_map, COLUMN_NAMES['task_scope'])
-        phase = get_cell_value(row, task_map, COLUMN_NAMES['task_phase'])
-        
-        if not all([scope, phase]):
-            logging.warning(f"Skipping WR '{wr}' due to missing Scope or Phase.")
-            continue
+    for row in target_rows:
+        scope = row.get(COLUMNS['scope_number']['target'])
+        phase = row.get(COLUMNS['scope_phase']['target'])
+        wr = row.get(COLUMNS['work_request']['target'])
+        crew = row.get(COLUMNS['assigned_resource']['target']) or PLACEHOLDER_CREW
+        placement = row.get(COLUMNS['job_placement']['target']) or 9999
+        poles = pole_assignments.get((scope, phase)) or 0
+        row_id = row['row_id']
 
-        job = Job(
-            wr=wr, scope=scope, phase=phase,
-            crew=wr_to_resource.get(wr) or PLACEHOLDER_CREW,
-            placement=get_cell_value(row, task_map, COLUMN_NAMES['target_placement']),
-            poles=get_cell_value(row, task_map, COLUMN_NAMES['task_poles'])
-        )
+        job = Job(scope, phase, wr, placement, crew, poles, row_id, is_placeholder=(crew == PLACEHOLDER_CREW))
         all_jobs.append(job)
-        
-    logging.info(f"Aggregated {len(all_jobs)} total jobs.")
-    return all_jobs
+        if not crews[crew].name:
+            crews[crew].name = crew
+        crews[crew].add_job(job)
 
-def allocate_poles(all_jobs, scope_to_poles):
-    """Allocates pole counts for jobs with missing values."""
-    if not all_jobs: return
-    logging.info("Allocating pole counts...")
-    
-    jobs_by_scope = defaultdict(list)
-    for job in all_jobs:
-        jobs_by_scope[job.scope].append(job)
+    return crews, all_jobs
 
-    for scope, jobs in jobs_by_scope.items():
-        total_poles = scope_to_poles.get(scope, 0)
-        if not total_poles: continue
-
-        assigned_poles = sum(job.poles for job in jobs if job.poles)
-        jobs_to_allocate = [job for job in jobs if not job.poles]
-        
-        if jobs_to_allocate:
-            remaining_poles = total_poles - assigned_poles
-            if remaining_poles > 0:
-                poles_per_job = int(math.ceil(remaining_poles / len(jobs_to_allocate)))
-                for job in jobs_to_allocate:
-                    job.poles = poles_per_job
-
-def perform_scheduling(all_jobs):
-    """Calculates cascading start/end dates."""
-    if not all_jobs: return
-    logging.info("Performing scheduling...")
-    crews = defaultdict(list)
-    for job in all_jobs:
-        crews[job.crew].append(job)
-
-    for crew_name, jobs in crews.items():
-        sorted_jobs = sorted(jobs, key=lambda j: j.placement)
-        current_date = datetime.now() 
-        for job in sorted_jobs:
-            duration = job.duration_days()
-            if duration > 0:
-                job.start_date = current_date
-                job.end_date = current_date + timedelta(days=duration - 1)
-                current_date = job.end_date + timedelta(days=1)
-
-def build_gantt_from_scratch(client, all_jobs, col_maps):
-    """Builds a 3-level Gantt chart from scratch in a single API call."""
-    if not all_jobs:
-        logging.warning("No data to build. Gantt sheet will be empty.")
-        return
-        
-    logging.info(f"Rebuilding Gantt chart on sheet ID {SHEET_ID_TARGET}...")
-    target_map = col_maps['target']
-    
-    try:
-        sheet = client.Sheets.get_sheet(SHEET_ID_TARGET)
-        if sheet.rows:
-            client.Sheets.delete_rows(SHEET_ID_TARGET, [r.id for r in sheet.rows])
-    except smartsheet.exceptions.ApiError as e:
-        if e.error.error_code != 1006: raise e
-
-    jobs_by_hierarchy = defaultdict(lambda: defaultdict(list))
-    for job in all_jobs:
-        jobs_by_hierarchy[job.scope][job.phase].append(job)
-
-    rows_to_add = []
-    for scope_name, phases in sorted(jobs_by_hierarchy.items()):
-        scope_row = smartsheet.models.Row()
-        scope_row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': scope_name})
-        
-        phase_rows = []
-        for phase_name, jobs in sorted(phases.items()):
-            phase_row = smartsheet.models.Row()
-            phase_row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': phase_name})
-            
-            wr_rows = []
-            for job in sorted(jobs, key=lambda j: j.placement):
-                wr_row = smartsheet.models.Row()
-                primary_col_id = target_map[COLUMN_NAMES['target_primary']]
-                cells = [{'column_id': primary_col_id, 'value': job.wr}]
-                
-                data_mapping = { 'scope': 'target_scope', 'phase': 'target_phase', 'wr': 'target_wr', 'poles': 'target_poles' }
-                for attr, key in data_mapping.items():
-                    col_id = target_map.get(COLUMN_NAMES[key])
-                    if col_id and col_id != primary_col_id:
-                        value = getattr(job, attr, None)
-                        if value is not None: cells.append({'column_id': col_id, 'value': value})
-
-                if job.start_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_start']], 'value': job.start_date.strftime('%Y-%m-%d')})
-                if job.end_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_end']], 'value': job.end_date.strftime('%Y-%m-%d')})
-
-                email = CREW_EMAILS.get(job.crew)
-                if email: cells.append({'column_id': target_map[COLUMN_NAMES['target_resource']], 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
-
-                wr_row.cells = cells
-                wr_rows.append(wr_row)
-            
-            phase_row.children = wr_rows
-            phase_rows.append(phase_row)
-        
-        scope_row.children = phase_rows
-        rows_to_add.append(scope_row)
-
-    if rows_to_add:
-        client.Sheets.add_rows(SHEET_ID_TARGET, rows_to_add)
-        logging.info(f"Successfully sent request to build Gantt chart.")
+def schedule_crews(crews, crew_start_dates):
+    for crew, sched in crews.items():
+        jobs = sorted(sched.jobs, key=lambda j: j.placement)
+        cur_date = crew_start_dates.get(crew) or datetime.today()
+        for job in jobs:
+            job.expected_start = cur_date
+            duration = job.duration()
+            job.expected_end = cur_date + timedelta(days=duration - 1)
+            cur_date = job.expected_end + timedelta(days=1)
 
 def main():
-    """Main workflow to run the entire scheduling and building process."""
     client = smartsheet.Smartsheet(API_TOKEN)
-    client.errors_as_exceptions(True)
-    
-    logging.info("Building column maps...")
-    try:
-        col_maps = {
-            'total_poles': build_column_map(client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)),
-            'task_list': build_column_map(client.Sheets.get_sheet(SHEET_ID_MASTER_TASK_LIST)),
-            'resource_lookup': build_column_map(client.Sheets.get_sheet(SHEET_ID_RESOURCE_LOOKUP)),
-            'target': build_column_map(client.Sheets.get_sheet(SHEET_ID_TARGET)),
-        }
-    except Exception as e:
-        logging.error(f"FATAL: Failed to build column maps. Check Sheet IDs, permissions, and column names. Error: {e}")
-        return
-    logging.info("Column maps built successfully.")
 
-    wr_to_resource, scope_to_poles = build_lookup_maps(client, col_maps)
-    all_jobs = aggregate_data(client, col_maps, wr_to_resource)
-    allocate_poles(all_jobs, scope_to_poles)
-    perform_scheduling(all_jobs)
-    build_gantt_from_scratch(client, all_jobs, col_maps)
+    total_poles_rows = get_sheet(client, SHEET_ID_TOTAL_POLES)
+    phase_poles_rows = get_sheet(client, SHEET_ID_PHASE_POLES)
+    target_rows = get_sheet(client, SHEET_ID_TARGET)
+
+    scope_totals = get_scope_totals(total_poles_rows)
+    phase_pole_actuals = get_phase_pole_actuals(phase_poles_rows)
+    all_phases = set()
+    for row in target_rows:
+        scope = row.get(COLUMNS['scope_number']['target'])
+        phase = row.get(COLUMNS['scope_phase']['target'])
+        if scope and phase:
+            all_phases.add((scope, phase))
+    pole_assignments = allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases)
+
+    crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
+
+    crew_start_dates = {crew: datetime.today() for crew in crews}
+    # TODO: Replace with advanced rotation if desired
+
+    schedule_crews(crews, crew_start_dates)
+
+    updates = []
+    valid_col_ids = {
+        'pole_count': str(COLUMNS['pole_count_phase']['target']),
+        'expected_start': str(COLUMNS['expected_start_date']['target']),
+        'expected_end': str(COLUMNS['expected_end_date']['target']),
+        'assigned_resource': str(COLUMNS['assigned_resource']['target']),
+    }
+    for job in all_jobs:
+        update_dict = {
+            'row_id': job.row_id,
+            valid_col_ids['pole_count']: job.poles,
+            valid_col_ids['expected_start']: job.expected_start.strftime('%Y-%m-%d') if job.expected_start else None,
+            valid_col_ids['expected_end']: job.expected_end.strftime('%Y-%m-%d') if job.expected_end else None,
+            valid_col_ids['assigned_resource']: job.crew,
+        }
+        # Only keep entries with valid column ids and not None
+        updates.append({k: v for k, v in update_dict.items() if (k == 'row_id' or (k in valid_col_ids.values() and v is not None))})
+
+    update_target_sheet(client, SHEET_ID_TARGET, updates)
+    logging.info("Smartsheet schedule updated successfully.")
+
+def update_target_sheet(client, sheet_id, updates):
+    batch = []
+    for update in updates:
+        row = smartsheet.models.Row()
+        row.id = update['row_id']
+        row.cells = []
+        for col_id, val in update.items():
+            if col_id == 'row_id':
+                continue
+            try:
+                row.cells.append({
+                    'column_id': int(col_id),
+                    'value': val
+                })
+            except Exception as e:
+                logging.warning(f"Could not update column {col_id}: {e}")
+        batch.append(row)
+    if batch:
+        client.Sheets.update_rows(sheet_id, batch)
+    else:
+        logging.info("No updates needed.")
 
 if __name__ == "__main__":
     main()

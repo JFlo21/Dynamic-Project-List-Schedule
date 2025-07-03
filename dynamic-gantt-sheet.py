@@ -1,8 +1,8 @@
 """
-Dynamic Gantt Scheduling System - V8.5 (Final & Corrected)
+Dynamic Gantt Scheduling System - V8.6 (Final & Corrected)
 
 - FINAL: Correctly maps "Scope ID #" as the phase identifier to build the full 3-level hierarchy.
-- FIX: Resolved 503 Service Unavailable errors by refactoring the build process to use a single, efficient API call for creating the entire hierarchy.
+- FIX: Resolved duplicate columnId error by intelligently building row cells, ensuring the primary column is not populated twice.
 - Dynamically discovers all column IDs by name at runtime.
 - Builds the Gantt chart from scratch on each run with full parent-child relationships.
 """
@@ -124,12 +124,12 @@ def allocate_poles(client, jobs_by_hierarchy, col_maps):
     total_poles_sheet = client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)
     total_poles_map = col_maps['total_poles']
     scope_totals = {
-        row.get_column(total_poles_map[COLUMN_NAMES['total_poles_scope']]).value: row.get_column(total_poles_map[COLUMN_NAMES['total_poles_count']]).value
+        row.get_column(total_poles_map[COLUMN_NAMES['total_poles_scope']]).value: float(row.get_column(total_poles_map[COLUMN_NAMES['total_poles_count']]).value or 0)
         for row in total_poles_sheet.rows if row.get_column(total_poles_map[COLUMN_NAMES['total_poles_scope']])
     }
 
     for scope, phases in jobs_by_hierarchy.items():
-        total_poles = float(scope_totals.get(scope, 0) or 0)
+        total_poles = scope_totals.get(scope, 0)
         if not total_poles: continue
 
         assigned_poles = sum(job.poles for phase in phases.values() for job in phase if job.poles)
@@ -191,30 +191,40 @@ def build_gantt_from_scratch(client, jobs_by_hierarchy, col_maps):
         phase_rows = []
         for phase_name, jobs in sorted(phases.items()):
             phase_row = smartsheet.models.Row()
-            # The name of the phase goes in the primary column of the child row
             phase_row.cells.append({'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': phase_name})
             
             wr_rows = []
             for job in sorted(jobs, key=lambda j: j.placement):
                 wr_row = smartsheet.models.Row()
                 
-                # Populate all cells for the work request
-                cells = [
-                    # The name of the WR goes in the primary column of the grandchild row
-                    {'column_id': target_map[COLUMN_NAMES['target_primary']], 'value': job.wr},
-                    # Add data to other dedicated columns for reporting
-                    {'column_id': target_map[COLUMN_NAMES['target_scope']], 'value': job.scope},
-                    {'column_id': target_map[COLUMN_NAMES['target_phase']], 'value': job.phase},
-                    {'column_id': target_map[COLUMN_NAMES['target_wr']], 'value': job.wr},
-                ]
+                # --- CORRECTED LOGIC TO PREVENT DUPLICATE COLUMN ID ---
+                primary_col_id = target_map[COLUMN_NAMES['target_primary']]
                 
+                # Start with the primary column cell, which contains the WR name for this row
+                cells = [{'column_id': primary_col_id, 'value': job.wr}]
+                
+                # Create a dictionary of other data to add to dedicated columns
+                dedicated_data = {
+                    COLUMN_NAMES['target_scope']: job.scope,
+                    COLUMN_NAMES['target_phase']: job.phase,
+                    COLUMN_NAMES['target_wr']: job.wr,
+                    COLUMN_NAMES['target_poles']: job.poles,
+                    COLUMN_NAMES['target_start']: job.start_date.strftime('%Y-%m-%d') if job.start_date else None,
+                    COLUMN_NAMES['target_end']: job.end_date.strftime('%Y-%m-%d') if job.end_date else None,
+                }
+                
+                # Add cells for dedicated columns, ONLY if they are not the primary column
+                for col_name, value in dedicated_data.items():
+                    col_id = target_map.get(col_name)
+                    if col_id and col_id != primary_col_id and value is not None:
+                        cells.append({'column_id': col_id, 'value': value})
+
+                # Add the contact list cell separately
                 email = CREW_EMAILS.get(job.crew)
-                if email: cells.append({'column_id': target_map[COLUMN_NAMES['target_resource']], 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
-                
-                if job.poles: cells.append({'column_id': target_map[COLUMN_NAMES['target_poles']], 'value': job.poles})
-                if job.start_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_start']], 'value': job.start_date.strftime('%Y-%m-%d')})
-                if job.end_date: cells.append({'column_id': target_map[COLUMN_NAMES['target_end']], 'value': job.end_date.strftime('%Y-%m-%d')})
-                
+                resource_col_id = target_map.get(COLUMN_NAMES['target_resource'])
+                if email and resource_col_id and resource_col_id != primary_col_id:
+                    cells.append({'column_id': resource_col_id, 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
+
                 wr_row.cells = cells
                 wr_rows.append(wr_row)
             

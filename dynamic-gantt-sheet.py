@@ -1,10 +1,10 @@
 """
-Advanced Dynamic Project Scheduler for Smartsheet
+Dynamic Gantt Scheduling System - V5.1 (Builder Edition)
 
-- V4: Simplified logic. Reads assigned resource directly from the target sheet.
-- Handles multiple sheets and advanced schedule logic for crews, phases, and work requests
-- Updates professional Gantt schedule with full hierarchy and cascading logic
-- Fills in placeholders and recalculates all expected/actuals as real data arrives
+- Implements the comprehensive game plan for dynamic scheduling.
+- Builds a full Gantt hierarchy (Scope > Phase > Work Request) from scratch on each run.
+- Dynamically allocates poles, assigns crews with placeholders, and calculates cascading dates.
+- All logic is centralized for creating a professional, automated schedule.
 
 Author: [Your Name/Org]
 """
@@ -19,257 +19,258 @@ from datetime import datetime, timedelta
 # -------- CONFIGURATION --------
 API_TOKEN = os.getenv('SMARTSHEET_API_TOKEN')
 
-# SHEET IDS (Resource Sheet has been removed)
-SHEET_ID_TOTAL_POLES = 8495204601384836
-SHEET_ID_PHASE_POLES = 1553121697288068
-SHEET_ID_TARGET      = 1847107938897796
+# --- DATA SOURCE SHEETS ---
+SHEET_ID_TOTAL_POLES = 8495204601384836 # Source of truth for total poles per scope
+SHEET_ID_PHASE_POLES = 1553121697288068 # Source of truth for all tasks (WRs, Phases, Scopes)
 
-# ---!!! ACTION REQUIRED: EDIT THIS DICTIONARY WITH YOUR CREW'S EMAILS !!!---
-# This map provides the required email for any crew assigned by name.
-# It MUST include an entry for your placeholder crew.
+# --- OUTPUT SHEET ---
+SHEET_ID_TARGET      = 1847107938897796 # BLANK sheet where the Gantt chart will be built
+
+# --- EMAILS FOR CONTACT OBJECTS ---
+# Provides the required email for any crew assigned by name.
 CREW_EMAILS = {
     "Crew A": "crew.a@yourcompany.com",
     "Crew B": "crew.b@yourcompany.com",
-    "Crew C": "crew.c@yourcompany.com",
     "Ramp-Up Crew (Estimate)": "placeholder.crew@yourcompany.com"
 }
 
-# Column ID mapping
+# --- COLUMN ID MAPPING ---
+# NOTE: All 'target' IDs refer to columns in the BLANK SHEET_ID_TARGET
 COLUMNS = {
-    "scope_number": {
-        "source_total": 3784709278224260,
-        "source_phase": 3784709278224260,
-        "target": 6392416854298500,
+    # This is the primary column on your target sheet.
+    "primary_target": 6392416854298500,
+    
+    # Mapping for the "Phase Poles" sheet (your master task list)
+    "source_task_list": {
+        "scope": 3784709278224260,
+        "phase": 1865904432041860,
+        "wr": 6922793410842500,
+        "poles": 2674900969672580,
+        "resource": 7828491195862916,
     },
-    "scope_phase": {
-        "source": 1865904432041860,
-        "target": 4140617040613252,
+    # Mapping for the "Total Poles" sheet
+    "source_total_poles": {
+        "scope": 3784709278224260,
+        "poles": 2795493429825412,
     },
-    "work_request": {
-        "source": 6922793410842500,
-        "target": 8644216667983748,
-    },
-    "assigned_resource": {
-        # This is the 'Assigned Resource' column on your main Gantt sheet
-        "target": 1945268683231108,
-    },
-    "job_placement": {
-        "target": 7574768217444228,
-    },
-    "expected_start_date": {
-        "target": 819368776388484,
-    },
-    "expected_end_date": {
-        "target": 3071168590073732,
-    },
-    "pole_count_phase": {
-        "source": 2674900969672580,
-        "target": 2674900969672580,
-    },
+    # Mapping for data columns in your blank Target Sheet
+    "target_gantt": {
+        "scope": 6392416854298500, # Also the primary column
+        "phase": 4140617040613252,
+        "wr": 8644216667983748,
+        "resource": 1945268683231108,
+        "placement": 7574768217444228,
+        "poles": 2674900969672580,
+        "start_date": 819368776388484,
+        "end_date": 3071168590073732,
+    }
 }
 
+# --- BUSINESS LOGIC ---
 POLES_PER_DAY = 1.2
 PLACEHOLDER_CREW = "Ramp-Up Crew (Estimate)"
 
 # -------- LOGGING --------
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-# -------- DATA CLASSES --------
+# -------- DATA STRUCTURES --------
 class Job:
-    def __init__(self, scope, phase, wr, placement, crew, poles, row_id, is_placeholder=False):
+    def __init__(self, wr, scope, phase, crew, placement, poles=0):
+        self.wr = wr
         self.scope = scope
         self.phase = phase
-        self.wr = wr
-        self.placement = placement
         self.crew = crew
-        self.poles = poles
-        self.row_id = row_id
-        self.is_placeholder = is_placeholder
-        self.expected_start = None
-        self.expected_end = None
+        self.placement = placement or 9999
+        self.poles = poles or 0
+        self.start_date = None
+        self.end_date = None
 
-    def duration(self):
-        return int(math.ceil(self.poles / POLES_PER_DAY)) if self.poles else 0
+    def duration_days(self):
+        return int(math.ceil(self.poles / POLES_PER_DAY)) if self.poles > 0 else 0
 
-class CrewSchedule:
-    def __init__(self, name):
-        self.name = name
-        self.jobs = []
+# -------- CORE LOGIC --------
+def get_cell_value(row, col_id):
+    """Safely gets a cell's value, handling objectValues for contacts."""
+    cell = row.get_column(col_id)
+    if not cell or cell.value is None:
+        return None
+    # For contact cells, prioritize the name from the objectValue
+    if cell.object_value and hasattr(cell.object_value, 'name'):
+        return cell.object_value.name
+    return cell.value
 
-    def add_job(self, job):
-        self.jobs.append(job)
-        self.jobs.sort(key=lambda j: j.placement if j.placement is not None else 9999)
-
-# -------- SHEET UTILITIES --------
-def get_sheet(client, sheet_id):
-    """Returns a list of row dicts with cell values keyed by column_id."""
-    sheet = client.Sheets.get_sheet(sheet_id)
-    rows = []
-    for row in sheet.rows:
-        cell_dict = {cell.column_id: cell.value for cell in row.cells}
-        cell_dict['row_id'] = row.id
-        rows.append(cell_dict)
-    return rows
-
-# -------- POLE LOGIC --------
-def get_scope_totals(total_poles_rows):
-    return {r.get(COLUMNS['scope_number']['source_total']): r.get(COLUMNS['pole_count_total']['source']) for r in total_poles_rows if r.get(COLUMNS['scope_number']['source_total'])}
-
-def get_phase_pole_actuals(phase_poles_rows):
-    return {(r.get(COLUMNS['scope_number']['source_phase']), r.get(COLUMNS['scope_phase']['source'])): r.get(COLUMNS['pole_count_phase']['source']) for r in phase_poles_rows if r.get(COLUMNS['scope_number']['source_phase']) and r.get(COLUMNS['scope_phase']['source'])}
-
-def allocate_unassigned_poles(scope_totals, phase_pole_actuals, all_phases):
-    results = dict(phase_pole_actuals)
-    by_scope = defaultdict(list)
-    for (scope, phase) in all_phases: by_scope[scope].append(phase)
-    for scope, total in scope_totals.items():
-        if total is None: continue
-        assigned = sum([phase_pole_actuals.get((scope, p), 0) or 0 for p in by_scope[scope]])
-        unassigned_phases = [p for p in by_scope[scope] if (scope, p) not in phase_pole_actuals]
-        if unassigned_phases:
-            remainder = total - assigned
-            if remainder > 0:
-                per_phase = int(math.ceil(remainder / len(unassigned_phases)))
-                for phase in unassigned_phases: results[(scope, phase)] = per_phase
-    return results
-
-# -------- SCHEDULE ENGINE --------
-def build_crews_and_jobs(target_rows, pole_assignments):
-    crews = defaultdict(lambda: CrewSchedule(name=None))
-    all_jobs = []
-    # Use the 'target' key for the assigned resource column ID
-    assigned_resource_col_id = COLUMNS['assigned_resource']['target']
+def aggregate_data_from_sources(client):
+    """Reads all source sheets and builds a unified, hierarchical dictionary of all jobs."""
+    logging.info("Aggregating data from source sheets...")
+    task_list_rows = client.Sheets.get_sheet(SHEET_ID_PHASE_POLES, include=['objectValue']).rows
     
-    for row in target_rows:
-        scope = row.get(COLUMNS['scope_number']['target'])
-        phase = row.get(COLUMNS['scope_phase']['target'])
-        if not scope or not phase: continue
+    jobs_by_hierarchy = defaultdict(lambda: defaultdict(list))
+    all_jobs = []
+
+    for row in task_list_rows:
+        scope = get_cell_value(row, COLUMNS['source_task_list']['scope'])
+        phase = get_cell_value(row, COLUMNS['source_task_list']['phase'])
+        wr = get_cell_value(row, COLUMNS['source_task_list']['wr'])
         
-        wr = row.get(COLUMNS['work_request']['target'])
-        # Read the value from the assigned resource column, or use the placeholder if it's empty
-        crew = row.get(assigned_resource_col_id) or PLACEHOLDER_CREW
-        placement = row.get(COLUMNS['job_placement']['target']) or 9999
-        poles = pole_assignments.get((scope, phase), 0)
-        
-        job = Job(scope, phase, wr, placement, crew, row['row_id'], is_placeholder=(crew == PLACEHOLDER_CREW))
+        if not all([scope, phase, wr]):
+            logging.warning(f"Skipping row {row.row_number} in source sheet due to missing Scope, Phase, or WR.")
+            continue
+
+        job = Job(
+            wr=wr, scope=scope, phase=phase,
+            crew=get_cell_value(row, COLUMNS['source_task_list']['resource']) or PLACEHOLDER_CREW,
+            placement=get_cell_value(row, COLUMNS['target_gantt']['placement']),
+            poles=get_cell_value(row, COLUMNS['source_task_list']['poles'])
+        )
+        jobs_by_hierarchy[scope][phase].append(job)
         all_jobs.append(job)
-        if not crews[crew].name: crews[crew].name = crew
-        crews[crew].add_job(job)
         
-    return crews, all_jobs
+    logging.info(f"Aggregated {len(all_jobs)} total jobs.")
+    return jobs_by_hierarchy, all_jobs
 
-def schedule_crews(crews, crew_start_dates):
-    for crew, sched in crews.items():
-        jobs = sorted(sched.jobs, key=lambda j: j.placement)
-        cur_date = crew_start_dates.get(crew) or datetime.today()
-        for job in jobs:
-            duration = job.duration()
+def allocate_poles(client, jobs_by_hierarchy):
+    """Calculates and assigns pole counts for phases with missing values."""
+    logging.info("Allocating pole counts...")
+    total_poles_sheet = client.Sheets.get_sheet(SHEET_ID_TOTAL_POLES)
+    scope_totals = {
+        row.get_column(COLUMNS['source_total_poles']['scope']).value: row.get_column(COLUMNS['source_total_poles']['poles']).value
+        for row in total_poles_sheet.rows
+    }
+
+    for scope, phases in jobs_by_hierarchy.items():
+        total_poles = scope_totals.get(scope, 0)
+        if not total_poles: continue
+
+        assigned_poles = sum(job.poles for phase in phases.values() for job in phase if job.poles)
+        phases_with_unknown_poles = [phase for phase, jobs in phases.items() if not any(j.poles for j in jobs)]
+
+        if phases_with_unknown_poles:
+            remaining_poles = total_poles - assigned_poles
+            if remaining_poles > 0:
+                poles_per_phase = int(math.ceil(remaining_poles / len(phases_with_unknown_poles)))
+                for phase_name in phases_with_unknown_poles:
+                    for job in jobs_by_hierarchy[scope][phase_name]:
+                        job.poles = poles_per_phase
+
+def perform_scheduling(all_jobs):
+    """Organizes jobs by crew and calculates cascading start/end dates."""
+    logging.info("Performing scheduling...")
+    crews = defaultdict(list)
+    for job in all_jobs:
+        crews[job.crew].append(job)
+
+    for crew_name, jobs in crews.items():
+        sorted_jobs = sorted(jobs, key=lambda j: j.placement)
+        current_date = datetime.now() 
+
+        for job in sorted_jobs:
+            duration = job.duration_days()
             if duration > 0:
-                job.expected_start = cur_date
-                job.expected_end = cur_date + timedelta(days=duration - 1)
-                cur_date = job.expected_end + timedelta(days=1)
+                job.start_date = current_date
+                job.end_date = current_date + timedelta(days=duration - 1)
+                # To calculate next start date, add 1 day. This simple logic doesn't skip weekends.
+                current_date = job.end_date + timedelta(days=1)
 
-# -------- MAIN WORKFLOW --------
+def build_gantt_from_scratch(client, scheduled_jobs):
+    """Deletes all rows in the target sheet and rebuilds the Gantt chart with hierarchy."""
+    logging.info(f"Rebuilding Gantt chart on sheet ID {SHEET_ID_TARGET}...")
+    
+    # 1. Clear the sheet to ensure a clean slate
+    try:
+        sheet = client.Sheets.get_sheet(SHEET_ID_TARGET)
+        if sheet.rows:
+            all_row_ids = [row.id for row in sheet.rows]
+            client.Sheets.delete_rows(SHEET_ID_TARGET, all_row_ids, ignore_errors=True)
+            logging.info(f"Deleted {len(all_row_ids)} existing rows.")
+    except smartsheet.exceptions.ApiError as e:
+        if e.error.error_code == 1006: # Sheet not found is okay
+            logging.info("Target sheet is empty. No rows to delete.")
+        else: raise e
+
+    # --- 2. Build Hierarchy: Scope (Parent) -> Phase (Child) -> WR (Grandchild) ---
+    scope_to_row_id = {}
+    phase_to_row_id = {}
+    all_rows_to_add = []
+    
+    # Group jobs by hierarchy for building
+    jobs_by_hierarchy = defaultdict(lambda: defaultdict(list))
+    for job in scheduled_jobs:
+        jobs_by_hierarchy[job.scope][job.phase].append(job)
+
+    # A. Create Parent (Scope) Rows
+    for scope_name in sorted(jobs_by_hierarchy.keys()):
+        row = smartsheet.models.Row()
+        row.cells.append({'column_id': COLUMNS['primary_target'], 'value': scope_name})
+        all_rows_to_add.append(row)
+    
+    if not all_rows_to_add:
+        logging.warning("No data found to build the schedule. Exiting.")
+        return
+        
+    added_rows = client.Sheets.add_rows(SHEET_ID_TARGET, all_rows_to_add).result
+    for row in added_rows:
+        scope_to_row_id[row.cells[0].value] = row.id
+
+    # B. Create Child (Phase) and Grandchild (WR) Rows
+    all_rows_to_add = []
+    for scope_name, phases in sorted(jobs_by_hierarchy.items()):
+        scope_row_id = scope_to_row_id.get(scope_name)
+        if not scope_row_id: continue
+
+        # Add a row for the phase
+        for phase_name, jobs in sorted(phases.items()):
+            phase_row = smartsheet.models.Row()
+            phase_row.parent_id = scope_row_id
+            phase_row.cells.append({'column_id': COLUMNS['primary_target'], 'value': phase_name})
+            phase_rows_to_add = client.Sheets.add_rows(SHEET_ID_TARGET, [phase_row]).result
+            phase_row_id = phase_rows_to_add[0].id
+
+            # Add rows for the work requests under this phase
+            wr_rows_to_add = []
+            for job in sorted(jobs, key=lambda j: j.placement):
+                wr_row = smartsheet.models.Row()
+                wr_row.parent_id = phase_row_id
+                
+                # Populate all cells for the job
+                cells = [
+                    {'column_id': COLUMNS['primary_target'], 'value': job.wr},
+                    {'column_id': COLUMNS['target_gantt']['scope'], 'value': job.scope},
+                    {'column_id': COLUMNS['target_gantt']['phase'], 'value': job.phase},
+                    {'column_id': COLUMNS['target_gantt']['wr'], 'value': job.wr}
+                ]
+                
+                email = CREW_EMAILS.get(job.crew)
+                if email:
+                    cells.append({'column_id': COLUMNS['target_gantt']['resource'], 'objectValue': {'objectType': 'CONTACT', 'name': job.crew, 'email': email}})
+                
+                if job.poles:
+                    cells.append({'column_id': COLUMNS['target_gantt']['poles'], 'value': job.poles})
+                if job.start_date:
+                    cells.append({'column_id': COLUMNS['target_gantt']['start_date'], 'value': job.start_date.strftime('%Y-%m-%d')})
+                if job.end_date:
+                    cells.append({'column_id': COLUMNS['target_gantt']['end_date'], 'value': job.end_date.strftime('%Y-%m-%d')})
+                
+                wr_row.cells = cells
+                wr_rows_to_add.append(wr_row)
+
+            if wr_rows_to_add:
+                client.Sheets.add_rows(SHEET_ID_TARGET, wr_rows_to_add)
+
+    logging.info(f"Successfully built Gantt chart.")
+
+# -------- MAIN EXECUTION --------
 def main():
+    """Main workflow to run the entire scheduling and building process."""
     client = smartsheet.Smartsheet(API_TOKEN)
     client.errors_as_exceptions(True)
+    
+    jobs_by_hierarchy, all_jobs = aggregate_data_from_sources(client)
+    allocate_poles(client, jobs_by_hierarchy)
+    perform_scheduling(all_jobs)
+    build_gantt_from_scratch(client, all_jobs)
 
-    logging.info("Loading data from project sheets...")
-    total_poles_rows = get_sheet(client, SHEET_ID_TOTAL_POLES)
-    phase_poles_rows = get_sheet(client, SHEET_ID_PHASE_POLES)
-    target_rows = get_sheet(client, SHEET_ID_TARGET)
-    logging.info("Data loaded.")
-
-    logging.info("Allocating pole counts...")
-    all_phases = set((r.get(COLUMNS['scope_number']['target']), r.get(COLUMNS['scope_phase']['target'])) for r in target_rows if r.get(COLUMNS['scope_number']['target']) and r.get(COLUMNS['scope_phase']['target']))
-    pole_assignments = allocate_unassigned_poles(get_scope_totals(total_poles_rows), get_phase_pole_actuals(phase_poles_rows), all_phases)
-    logging.info("Pole counts allocated.")
-
-    logging.info("Building crew schedules...")
-    crews, all_jobs = build_crews_and_jobs(target_rows, pole_assignments)
-    logging.info("Schedules built.")
-
-    logging.info("Calculating dynamic schedule dates...")
-    schedule_crews(crews, {crew: datetime.today() for crew in crews})
-    logging.info("Schedule dates calculated.")
-
-    logging.info("Preparing data for Smartsheet update...")
-    updates = []
-    for job in all_jobs:
-        update_dict = {
-            'row_id': job.row_id,
-            str(COLUMNS['pole_count_phase']['target']): job.poles,
-            str(COLUMNS['expected_start_date']['target']): job.expected_start.strftime('%Y-%m-%d') if job.expected_start else None,
-            str(COLUMNS['expected_end_date']['target']): job.expected_end.strftime('%Y-%m-%d') if job.expected_end else None,
-            str(COLUMNS['assigned_resource']['target']): job.crew,
-        }
-        updates.append({k: v for k, v in update_dict.items() if k != 'row_id' and v is not None or k == 'row_id'})
-
-    update_target_sheet(client, SHEET_ID_TARGET, updates)
-    logging.info("Smartsheet schedule updated successfully.")
-
-# -------- CORRECTED UPDATE FUNCTION --------
-def update_target_sheet(client, sheet_id, updates):
-    """Updates rows in Smartsheet, using the CREW_EMAILS map to create contacts."""
-    batch = []
-    contact_col_id = COLUMNS['assigned_resource']['target']
-
-    for update in updates:
-        row = smartsheet.models.Row()
-        row.id = update['row_id']
-        row.cells = []
-        for col_id_str, val in update.items():
-            if col_id_str == 'row_id' or val is None:
-                continue
-            
-            col_id = int(col_id_str)
-            new_cell = {'column_id': col_id}
-
-            if col_id == contact_col_id:
-                resource_identifier = str(val)
-                contact_name = resource_identifier
-                contact_email = None
-
-                # Check if the identifier is an email itself
-                if '@' in resource_identifier:
-                    contact_email = resource_identifier
-                # Otherwise, look it up in our map
-                else:
-                    contact_email = CREW_EMAILS.get(resource_identifier)
-
-                if contact_email:
-                    new_cell['objectValue'] = {
-                        "objectType": "CONTACT",
-                        "name": contact_name,
-                        "email": contact_email
-                    }
-                else:
-                    logging.warning(f"Could not find an email for resource '{resource_identifier}' on row {row.id}. Skipping assignment.")
-                    continue 
-            else:
-                new_cell['value'] = val
-            
-            row.cells.append(new_cell)
-
-        if row.cells:
-            batch.append(row)
-
-    if batch:
-        logging.info(f"Updating {len(batch)} rows in the target sheet.")
-        client.Sheets.update_rows(sheet_id, batch)
-    else:
-        logging.info("No rows required updates in the target sheet.")
-
-# -------- MAIN EXECUTION BLOCK --------
 if __name__ == "__main__":
     try:
         main()
-    except smartsheet.exceptions.ApiError as e:
-        logging.error(f"Smartsheet API Error: {e.result.message}")
-        logging.error(f"Error Code: {e.result.errorCode}, Ref ID: {e.result.refId}")
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
+        logging.error(f"A critical error occurred: {e}", exc_info=True)
